@@ -28,7 +28,16 @@ from datetime import datetime, timedelta, timezone
 import requests
 from telethon.sync import TelegramClient
 from telethon.sessions import StringSession
-from telethon.errors import FloodWaitError, PeerFloodError
+from telethon.tl import functions, types
+from telethon.errors import (
+    FloodWaitError,
+    PeerFloodError,
+    InviteHashExpiredError,
+    InviteHashInvalidError,
+    UsernameNotOccupiedError,
+    UsernameInvalidError,
+    ChannelPrivateError,
+)
 
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
@@ -45,11 +54,26 @@ DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "50"))
 DELAY_SECONDS = float(os.environ.get("DELAY_SECONDS", "2"))
 MAX_SCAN_PER_DIALOG = int(os.environ.get("MAX_SCAN_PER_DIALOG", "300"))
 FLOOD_ABORT_SECONDS = int(os.environ.get("FLOOD_ABORT_HOURS", "4")) * 3600
+VALIDATE_URLS = os.environ.get("VALIDATE_URLS", "1") != "0"
 
 URL_REGEX = re.compile(
     r'(?:https?://|www\.|t\.me/|telegram\.me/)[^\s<>"\')\]]+',
     re.IGNORECASE,
 )
+
+# t.me/joinchat/HASH or t.me/+HASH -- private invite links (need CheckChatInviteRequest)
+TG_INVITE_HASH_REGEX = re.compile(
+    r'(?:t\.me|telegram\.me)/(?:joinchat/|\+)([A-Za-z0-9_-]+)', re.IGNORECASE
+)
+# t.me/username -- public group/channel links (need get_entity)
+TG_USERNAME_REGEX = re.compile(
+    r'(?:t\.me|telegram\.me)/([A-Za-z0-9_]{4,32})(?:[/?]|$)', re.IGNORECASE
+)
+# path segments that are t.me features, not a group/channel username -- never resolve these
+TG_RESERVED_PATHS = {
+    "joinchat", "share", "addstickers", "addemoji", "addtheme", "proxy",
+    "socks", "iv", "s", "c", "bg", "login", "confirmphone", "setlanguage",
+}
 
 KV_BASE = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/storage/kv/namespaces/{CF_KV_NAMESPACE_ID}"
 KV_HEADERS = {"Authorization": f"Bearer {CF_API_TOKEN}"}
@@ -63,6 +87,83 @@ def extract_urls_from_text(text):
     if not text:
         return []
     return [clean_url(u) for u in URL_REGEX.findall(text)]
+
+
+def classify_telegram_url(client, url):
+    """Resolve a Telegram link against the live API and classify it.
+
+    Returns one of:
+      'group'        -- confirmed group/megagroup, not expired -- KEEP
+      'channel'       -- confirmed broadcast channel -- DROP
+      'expired'       -- private invite link, expired/revoked -- DROP
+      'invalid'       -- link doesn't resolve to anything real -- DROP
+      'not_telegram'  -- not a t.me/telegram.me link at all -- KEEP as-is (unvalidated)
+      'unknown'       -- resolution failed for a transient reason (flood, etc) -- KEEP, unverified
+
+    Costs exactly one extra Telegram API call per *new* candidate URL (skipped
+    entirely for URLs already in `seen_urls`, and skippable globally via
+    VALIDATE_URLS=0).
+    """
+    m = TG_INVITE_HASH_REGEX.search(url)
+    if m:
+        invite_hash = m.group(1)
+        try:
+            result = client(functions.messages.CheckChatInviteRequest(hash=invite_hash))
+        except FloodWaitError as e:
+            if e.seconds <= 60:
+                safe_sleep(e.seconds)
+                try:
+                    result = client(functions.messages.CheckChatInviteRequest(hash=invite_hash))
+                except Exception:
+                    return "unknown"
+            else:
+                return "unknown"
+        except (InviteHashExpiredError,):
+            return "expired"
+        except (InviteHashInvalidError,):
+            return "invalid"
+        except Exception as e:
+            print(f"::warning::classify_telegram_url invite check failed for {url}: {type(e).__name__}: {e}")
+            return "unknown"
+
+        if isinstance(result, (types.ChatInviteAlready, types.ChatInvitePeek)):
+            chat = result.chat
+            return "channel" if getattr(chat, "broadcast", False) else "group"
+        if isinstance(result, types.ChatInvite):
+            return "channel" if getattr(result, "broadcast", False) else "group"
+        return "unknown"
+
+    m2 = TG_USERNAME_REGEX.search(url)
+    if m2:
+        username = m2.group(1)
+        if username.lower() in TG_RESERVED_PATHS:
+            return "not_telegram"
+        try:
+            entity = client.get_entity(username)
+        except FloodWaitError as e:
+            if e.seconds <= 60:
+                safe_sleep(e.seconds)
+                try:
+                    entity = client.get_entity(username)
+                except Exception:
+                    return "unknown"
+            else:
+                return "unknown"
+        except (UsernameNotOccupiedError, UsernameInvalidError, ValueError):
+            return "invalid"
+        except ChannelPrivateError:
+            return "invalid"
+        except Exception as e:
+            print(f"::warning::classify_telegram_url username lookup failed for {url}: {type(e).__name__}: {e}")
+            return "unknown"
+
+        if isinstance(entity, types.Channel):
+            return "channel" if entity.broadcast else "group"
+        if isinstance(entity, types.Chat):
+            return "group"
+        return "invalid"  # resolved to a User or something else, not a group/channel
+
+    return "not_telegram"
 
 
 def kv_get(key, default):
@@ -109,12 +210,23 @@ def notify(text: str) -> bool:
         return False
 
 
-def send_results(new_urls, total_seen):
+def send_results(new_urls, total_seen, rejected=None):
+    rejected = rejected or {}
+    filtered_note = ""
+    if any(rejected.values()):
+        filtered_note = (
+            f"\n🧹 Filtered out -- channel: {rejected.get('channel', 0)}, "
+            f"expired: {rejected.get('expired', 0)}, invalid: {rejected.get('invalid', 0)}"
+        )
+
     if not new_urls:
-        notify(f"✅ Run complete. No new urls found this time. Total all-time: {total_seen}.")
+        notify(f"✅ Run complete. No new urls found this time. Total all-time: {total_seen}.{filtered_note}")
         return
 
-    header = f"✅ Done: {len(new_urls)} new URL(s) (cap {DAILY_LIMIT}). Total all-time: {total_seen}\n\n"
+    header = (
+        f"✅ Done: {len(new_urls)} new URL(s) (cap {DAILY_LIMIT}). "
+        f"Total all-time: {total_seen}{filtered_note}\n\n"
+    )
     body = "\n".join(new_urls)
     full = header + body
     chunks = [full[i:i + 4000] for i in range(0, len(full), 4000)]
@@ -159,6 +271,7 @@ def run():
     groups_data = full_dataset.get("groups", {})
 
     new_urls_this_run = []
+    rejected = {"channel": 0, "expired": 0, "invalid": 0}
 
     def persist():
         kv_put("state", {"cursors": cursors, "seen_urls": sorted(seen_urls)})
@@ -216,12 +329,26 @@ def run():
                         last_seen_id = max(last_seen_id, message.id)
 
                         for u in extract_urls_from_text(message.raw_text):
-                            if u not in seen_urls:
-                                seen_urls.add(u)
-                                new_urls_this_run.append(u)
-                                g = groups_data.setdefault(gid, {"group_name": dialog.name, "urls": [], "count": 0})
-                                g["urls"].append(u)
-                                g["count"] = len(g["urls"])
+                            if u in seen_urls:
+                                continue
+
+                            if VALIDATE_URLS:
+                                kind = classify_telegram_url(client, u)
+                                safe_sleep(DELAY_SECONDS)  # rate-limit the validation call too
+                            else:
+                                kind = "not_telegram"  # skip validation entirely
+
+                            if kind in ("channel", "expired", "invalid"):
+                                seen_urls.add(u)  # never re-check this one again
+                                rejected[kind] += 1
+                                continue
+
+                            # 'group', 'not_telegram', or 'unknown' -- keep it
+                            seen_urls.add(u)
+                            new_urls_this_run.append(u)
+                            g = groups_data.setdefault(gid, {"group_name": dialog.name, "urls": [], "count": 0})
+                            g["urls"].append(u)
+                            g["count"] = len(g["urls"])
                             if len(new_urls_this_run) >= DAILY_LIMIT:
                                 break
 
@@ -251,8 +378,11 @@ def run():
         sys.exit(1)
 
     persist()
-    send_results(new_urls_this_run, len(seen_urls))
-    print(f"DONE: {len(new_urls_this_run)} new urls this run. Total all-time: {len(seen_urls)}")
+    send_results(new_urls_this_run, len(seen_urls), rejected)
+    print(
+        f"DONE: {len(new_urls_this_run)} new urls this run. Total all-time: {len(seen_urls)}. "
+        f"Rejected: {rejected}"
+    )
 
 
 if __name__ == "__main__":
