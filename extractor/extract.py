@@ -6,10 +6,13 @@ gp-ext-workflow extractor (Command & Control version)
 - Extracts at most DAILY_LIMIT *new* URLs per run, resuming per-group from
   where it left off (cursor persisted in Cloudflare KV).
 - 2s delay between messages read.
-- FloodWaitError handling:
+- FloodWaitError handling (has a known wait time):
     * wait <= FLOOD_ABORT_SECONDS (default 4h): sleep it out, notify if long.
     * wait  > FLOOD_ABORT_SECONDS: save progress, notify with resume time,
       and abort the whole run (exit 1) instead of blocking the runner.
+- PeerFloodError handling (NO known wait time -- account got anti-spam
+  flagged for too many peer/history requests): save progress, notify that
+  there's no ETA, and abort immediately. Retrying soon will not help.
 - Any unhandled error: notify the bot with the error, then exit 1 so the
   GitHub Actions run is also marked failed.
 - Sends a start ping and a final summary (with the new URLs) to the bot.
@@ -25,7 +28,7 @@ from datetime import datetime, timedelta, timezone
 import requests
 from telethon.sync import TelegramClient
 from telethon.sessions import StringSession
-from telethon.errors import FloodWaitError
+from telethon.errors import FloodWaitError, PeerFloodError
 
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
@@ -141,64 +144,84 @@ def run():
 
     notify(f"🚀 Extraction started. Target: {DAILY_LIMIT} new urls.")
 
-    with TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH) as client:
-        for dialog in client.iter_dialogs():
-            if len(new_urls_this_run) >= DAILY_LIMIT:
-                break
-            if not (dialog.is_group or dialog.is_channel):
-                continue
+    current_gid = [None]  # mutable box so the except block can see the in-progress group
 
-            gid = str(dialog.id)
-            last_seen_id = cursors.get(gid, 0)
-            scanned = 0
-
-            while len(new_urls_this_run) < DAILY_LIMIT and scanned < MAX_SCAN_PER_DIALOG:
-                try:
-                    messages = list(
-                        client.iter_messages(dialog, min_id=last_seen_id, reverse=True, limit=20)
-                    )
-                except FloodWaitError as e:
-                    if e.seconds > FLOOD_ABORT_SECONDS:
-                        resume_at = datetime.now(timezone.utc) + timedelta(seconds=e.seconds)
-                        notify(
-                            f"⚠️ FloodWait {e.seconds}s (~{e.seconds/3600:.1f}h) ကြုံရပါတယ်.\n"
-                            f"{FLOOD_ABORT_SECONDS // 3600}h ကျော်လို့ workflow ကို ရပ်လိုက်ပါပြီ။\n"
-                            f"ခန့်မှန်း resume time: {resume_at.strftime('%Y-%m-%d %H:%M UTC')}"
-                        )
-                        cursors[gid] = last_seen_id
-                        persist()
-                        sys.exit(1)
-                    else:
-                        if e.seconds > 30:
-                            notify(f"⏳ FloodWait {e.seconds}s ကြုံရလို့ စောင့်နေပါတယ်...")
-                        safe_sleep(e.seconds)
-                        continue
-
-                if not messages:
+    try:
+        with TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH) as client:
+            for dialog in client.iter_dialogs():
+                if len(new_urls_this_run) >= DAILY_LIMIT:
                     break
+                if not (dialog.is_group or dialog.is_channel):
+                    continue
 
-                for message in messages:
-                    scanned += 1
-                    last_seen_id = max(last_seen_id, message.id)
+                gid = str(dialog.id)
+                current_gid[0] = gid
+                last_seen_id = cursors.get(gid, 0)
+                scanned = 0
 
-                    for u in extract_urls_from_text(message.raw_text):
-                        if u not in seen_urls:
-                            seen_urls.add(u)
-                            new_urls_this_run.append(u)
-                            g = groups_data.setdefault(gid, {"group_name": dialog.name, "urls": [], "count": 0})
-                            g["urls"].append(u)
-                            g["count"] = len(g["urls"])
+                while len(new_urls_this_run) < DAILY_LIMIT and scanned < MAX_SCAN_PER_DIALOG:
+                    try:
+                        messages = list(
+                            client.iter_messages(dialog, min_id=last_seen_id, reverse=True, limit=20)
+                        )
+                    except FloodWaitError as e:
+                        if e.seconds > FLOOD_ABORT_SECONDS:
+                            resume_at = datetime.now(timezone.utc) + timedelta(seconds=e.seconds)
+                            notify(
+                                f"⚠️ FloodWait {e.seconds}s (~{e.seconds/3600:.1f}h) ကြုံရပါတယ်.\n"
+                                f"{FLOOD_ABORT_SECONDS // 3600}h ကျော်လို့ workflow ကို ရပ်လိုက်ပါပြီ။\n"
+                                f"ခန့်မှန်း resume time: {resume_at.strftime('%Y-%m-%d %H:%M UTC')}"
+                            )
+                            cursors[gid] = last_seen_id
+                            persist()
+                            sys.exit(1)
+                        else:
+                            if e.seconds > 30:
+                                notify(f"⏳ FloodWait {e.seconds}s ကြုံရလို့ စောင့်နေပါတယ်...")
+                            safe_sleep(e.seconds)
+                            continue
+
+                    if not messages:
+                        break
+
+                    for message in messages:
+                        scanned += 1
+                        last_seen_id = max(last_seen_id, message.id)
+
+                        for u in extract_urls_from_text(message.raw_text):
+                            if u not in seen_urls:
+                                seen_urls.add(u)
+                                new_urls_this_run.append(u)
+                                g = groups_data.setdefault(gid, {"group_name": dialog.name, "urls": [], "count": 0})
+                                g["urls"].append(u)
+                                g["count"] = len(g["urls"])
+                            if len(new_urls_this_run) >= DAILY_LIMIT:
+                                break
+
+                        safe_sleep(DELAY_SECONDS)
                         if len(new_urls_this_run) >= DAILY_LIMIT:
                             break
 
-                    safe_sleep(DELAY_SECONDS)
-                    if len(new_urls_this_run) >= DAILY_LIMIT:
+                    if scanned >= MAX_SCAN_PER_DIALOG or len(new_urls_this_run) >= DAILY_LIMIT:
                         break
 
-                if scanned >= MAX_SCAN_PER_DIALOG or len(new_urls_this_run) >= DAILY_LIMIT:
-                    break
+                cursors[gid] = last_seen_id
 
-            cursors[gid] = last_seen_id
+    except PeerFloodError:
+        # No wait-time given by Telegram for this one -- the account itself has
+        # been rate-limited for too many peer/history requests. Retrying
+        # immediately (or even in a few minutes) will not help; Telegram gives
+        # no ETA. Save whatever progress we made and stop the whole run.
+        if current_gid[0]:
+            cursors[current_gid[0]] = cursors.get(current_gid[0], 0)
+        persist()
+        notify(
+            "🚫 Peer Flood ကြုံရပါတယ်.\n"
+            "Telegram က account ကို peer/history request များလွန်းလို့ temporarily flag တင်လိုက်ပါတယ်.\n"
+            "ဒါက FloodWait လို တိတိကျကျ wait time မပါဘူး -- ရက်ချီနိုင်ပါတယ်.\n"
+            "Workflow ကို ရပ်လိုက်ပါပြီ. ခဏနားပြီးမှ /extract ကို ပြန်စမ်းပါ (24h+ စောင့်ဖို့ recommend)."
+        )
+        sys.exit(1)
 
     persist()
     send_results(new_urls_this_run, len(seen_urls))
