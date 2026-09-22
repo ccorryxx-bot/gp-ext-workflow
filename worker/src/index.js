@@ -1,5 +1,12 @@
 const REPO = "ccorryxx-bot/gp-ext-workflow";
-const WORKFLOW_FILE = "extract.yml";
+
+// One entry per Telegram account this worker manages. Add a new account by
+// adding a key here + its own <KEY>_API_ID/<KEY>_API_HASH/<KEY>_STRING_SESSION
+// GitHub secrets + a matching .github/workflows/extract-<key>.yml.
+const ACCOUNTS = {
+  vsn: { label: "VSN", workflowFile: "extract-vsn.yml" },
+  izm: { label: "IZM", workflowFile: "extract-izm.yml" },
+};
 
 export default {
   async fetch(request, env) {
@@ -14,7 +21,7 @@ export default {
     }
 
     return new Response(
-      "gp-ext-workflow worker is running.\n\nEndpoints:\n  POST /telegram-webhook  (Telegram only)\n  GET  /urls              (extracted urls)",
+      "gp-ext-workflow worker is running.\n\nEndpoints:\n  POST /telegram-webhook  (Telegram only)\n  GET  /urls?account=vsn|izm  (extracted urls)",
       { status: 200, headers: { "content-type": "text/plain" } }
     );
   },
@@ -34,6 +41,11 @@ async function handleWebhook(request, env) {
     return new Response("ok");
   }
 
+  if (update.callback_query) {
+    await handleCallbackQuery(update.callback_query, env);
+    return new Response("ok");
+  }
+
   const message = update.message;
   if (!message || !message.text) {
     return new Response("ok");
@@ -45,23 +57,36 @@ async function handleWebhook(request, env) {
     return new Response("ok");
   }
 
-  const text = message.text.trim();
+  const parts = message.text.trim().split(/\s+/);
+  const cmd = parts[0];
+  const arg = (parts[1] || "").toLowerCase();
 
-  if (text === "/extract") {
-    try {
-      await triggerWorkflow(env);
-      await reply(env, chatId, "🚀 Extraction workflow triggered. GitHub Actions run started.");
-    } catch (e) {
-      await reply(env, chatId, `❌ Could not trigger workflow: ${e.message}`);
+  if (cmd === "/extract") {
+    await reply(env, chatId, "ဘယ် account ကို extract run မလဲ?", {
+      inline_keyboard: [
+        [
+          { text: "🟦 VSN", callback_data: "extract:vsn" },
+          { text: "🟩 IZM", callback_data: "extract:izm" },
+        ],
+        [{ text: "🔀 Both", callback_data: "extract:both" }],
+      ],
+    });
+  } else if (cmd === "/status") {
+    if (arg === "vsn" || arg === "izm") {
+      await reply(env, chatId, await getStatus(env, arg));
+    } else {
+      const vsn = await getStatus(env, "vsn");
+      const izm = await getStatus(env, "izm");
+      await reply(env, chatId, `${vsn}\n\n----------\n\n${izm}`);
     }
-  } else if (text === "/status") {
-    const statusText = await getStatus(env);
-    await reply(env, chatId, statusText);
-  } else if (text === "/help" || text === "/start") {
+  } else if (cmd === "/help" || cmd === "/start") {
     await reply(
       env,
       chatId,
-      "Commands:\n/extract - run extraction now\n/status - latest run status + total urls\n/help - this message"
+      "Commands:\n" +
+        "/extract - run extraction now (asks VSN / IZM / Both)\n" +
+        "/status [vsn|izm] - latest run status + total urls (both if no arg)\n" +
+        "/help - this message"
     );
   } else {
     await reply(env, chatId, "Unknown command. Try /help");
@@ -70,9 +95,47 @@ async function handleWebhook(request, env) {
   return new Response("ok");
 }
 
-async function triggerWorkflow(env) {
+async function handleCallbackQuery(cq, env) {
+  const chatId = String(cq.message?.chat?.id || "");
+  if (env.BOT_CHAT_ID && chatId !== String(env.BOT_CHAT_ID)) {
+    await answerCallback(env, cq.id, "Not authorized");
+    return;
+  }
+
+  const data = cq.data || "";
+  const [action, target] = data.split(":");
+
+  if (action !== "extract") {
+    await answerCallback(env, cq.id, "Unknown action");
+    return;
+  }
+
+  const targets = target === "both" ? ["vsn", "izm"] : [target];
+  const validTargets = targets.filter((t) => ACCOUNTS[t]);
+
+  if (!validTargets.length) {
+    await answerCallback(env, cq.id, "Unknown account");
+    return;
+  }
+
+  await answerCallback(env, cq.id, "Triggering...");
+
+  const results = [];
+  for (const t of validTargets) {
+    try {
+      await triggerWorkflow(env, ACCOUNTS[t].workflowFile);
+      results.push(`✅ ${ACCOUNTS[t].label}: workflow triggered`);
+    } catch (e) {
+      results.push(`❌ ${ACCOUNTS[t].label}: ${e.message}`);
+    }
+  }
+
+  await reply(env, chatId, `🚀 Extraction request:\n\n${results.join("\n")}`);
+}
+
+async function triggerWorkflow(env, workflowFile) {
   const resp = await fetch(
-    `https://api.github.com/repos/${REPO}/actions/workflows/${WORKFLOW_FILE}/dispatches`,
+    `https://api.github.com/repos/${REPO}/actions/workflows/${workflowFile}/dispatches`,
     {
       method: "POST",
       headers: {
@@ -89,11 +152,16 @@ async function triggerWorkflow(env) {
   }
 }
 
-async function getStatus(env) {
+async function getStatus(env, account) {
+  const acc = ACCOUNTS[account];
+  if (!acc) {
+    return `❓ Unknown account: ${account}`;
+  }
+
   let runLine = "Run info unavailable.";
   try {
     const resp = await fetch(
-      `https://api.github.com/repos/${REPO}/actions/workflows/${WORKFLOW_FILE}/runs?per_page=1`,
+      `https://api.github.com/repos/${REPO}/actions/workflows/${acc.workflowFile}/runs?per_page=1`,
       {
         headers: {
           Authorization: `token ${env.GH_PAT}`,
@@ -114,7 +182,7 @@ async function getStatus(env) {
 
   let urlLine = "No dataset yet.";
   try {
-    const data = await env.GP_URLS.get("urls", "json");
+    const data = await env.GP_URLS.get(`${account}:urls`, "json");
     if (data) {
       urlLine = `Total urls: ${data.total_urls} across ${data.total_groups} groups\nLast updated: ${data.generated_at}`;
     }
@@ -122,14 +190,26 @@ async function getStatus(env) {
     urlLine = `KV read failed: ${e.message}`;
   }
 
-  return `📊 Status\n\n${runLine}\n\n${urlLine}`;
+  return `📊 ${acc.label} Status\n\n${runLine}\n\n${urlLine}`;
 }
 
-async function reply(env, chatId, text) {
+async function reply(env, chatId, text, inlineKeyboard) {
+  const body = { chat_id: chatId, text, disable_web_page_preview: true };
+  if (inlineKeyboard) {
+    body.reply_markup = inlineKeyboard;
+  }
   await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendMessage`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text, disable_web_page_preview: true }),
+    body: JSON.stringify(body),
+  });
+}
+
+async function answerCallback(env, callbackQueryId, text) {
+  await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/answerCallbackQuery`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ callback_query_id: callbackQueryId, text }),
   });
 }
 
@@ -143,7 +223,15 @@ async function handleUrls(request, env) {
     }
   }
 
-  const data = await env.GP_URLS.get("urls", "json");
+  const account = url.searchParams.get("account");
+  if (!account || !ACCOUNTS[account]) {
+    return Response.json(
+      { error: "Missing or unknown ?account=. Valid values: " + Object.keys(ACCOUNTS).join(", ") },
+      { status: 400 }
+    );
+  }
+
+  const data = await env.GP_URLS.get(`${account}:urls`, "json");
   if (!data) {
     return Response.json({ error: "No data yet. Run the extractor first." }, { status: 404 });
   }
@@ -167,6 +255,7 @@ async function handleUrls(request, env) {
   }
 
   return Response.json({
+    account,
     generated_at: data.generated_at,
     total_groups: Object.keys(groups).length,
     total_urls: Object.values(groups).reduce((sum, g) => sum + g.count, 0),

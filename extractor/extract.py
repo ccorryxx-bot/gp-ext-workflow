@@ -63,6 +63,15 @@ CF_ACCOUNT_ID = os.environ["CF_ACCOUNT_ID"]
 CF_API_TOKEN = os.environ["CF_API_TOKEN"]
 CF_KV_NAMESPACE_ID = os.environ["CF_KV_NAMESPACE_ID"]
 
+# Which Telegram account this run is for (e.g. "vsn", "izm"). Multiple
+# accounts can share one KV namespace + one bot chat: this prefixes every
+# KV key ("<account>:state", "<account>:urls") so their data never
+# collides, and every bot message gets tagged "[VSN]"/"[IZM]" so it's
+# obvious which account it came from.
+ACCOUNT = os.environ.get("ACCOUNT", "default")
+KV_STATE_KEY = f"{ACCOUNT}:state"
+KV_URLS_KEY = f"{ACCOUNT}:urls"
+
 DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "50"))
 # Per-message/per-validation-call pacing is randomized within this range
 # instead of a fixed delay, so the request rhythm doesn't look scripted.
@@ -210,10 +219,14 @@ def kv_put(key, value: dict):
 
 
 def _send_telegram_message(text: str, parse_mode: str | None = None) -> bool:
-    """Low-level sender. Returns True only if Telegram confirmed delivery
-    (ok:true). Any failure -- network OR Telegram API rejection -- is
-    surfaced as a GitHub Actions ::error:: annotation, so a silent bot
+    """Low-level sender. Every message is tagged with the account (e.g.
+    "[VSN] ...") when ACCOUNT is set, so multiple accounts sharing one bot
+    chat stay distinguishable. Returns True only if Telegram confirmed
+    delivery (ok:true). Any failure -- network OR Telegram API rejection --
+    is surfaced as a GitHub Actions ::error:: annotation, so a silent bot
     failure still shows up loudly in the run summary."""
+    if ACCOUNT and ACCOUNT != "default":
+        text = f"[{ACCOUNT.upper()}] {text}"
     payload = {"chat_id": BOT_CHAT_ID, "text": text, "disable_web_page_preview": True}
     if parse_mode:
         payload["parse_mode"] = parse_mode
@@ -300,7 +313,7 @@ def batch_rest_sleep():
 
 
 def run():
-    state = kv_get("state", {"cursors": {}, "seen_by_group": {}, "url_classifications": {}})
+    state = kv_get(KV_STATE_KEY, {"cursors": {}, "seen_by_group": {}, "url_classifications": {}})
     cursors = state.get("cursors", {})
     # seen_by_group: gid -> set of urls already recorded FOR THAT GROUP.
     # The same url can exist under multiple groups -- it's only a duplicate
@@ -311,7 +324,7 @@ def run():
     # different groups only ever costs 1 Telegram validation call, not 5.
     url_classifications = dict(state.get("url_classifications", {}))
 
-    full_dataset = kv_get("urls", {"groups": {}})
+    full_dataset = kv_get(KV_URLS_KEY, {"groups": {}})
     groups_data = full_dataset.get("groups", {})
 
     new_urls_this_run = []
@@ -319,12 +332,12 @@ def run():
     validation_calls = [0]  # mutable box, just for the final log line
 
     def persist():
-        kv_put("state", {
+        kv_put(KV_STATE_KEY, {
             "cursors": cursors,
             "seen_by_group": {gid: sorted(urls) for gid, urls in seen_by_group.items()},
             "url_classifications": url_classifications,
         })
-        kv_put("urls", {
+        kv_put(KV_URLS_KEY, {
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "total_groups": len(groups_data),
             "total_urls": sum(len(g.get("urls", [])) for g in groups_data.values()),

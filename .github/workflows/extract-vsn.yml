@@ -1,0 +1,42 @@
+name: vsn_ext_workflow
+
+on:
+  schedule:
+    - cron: "0 3 * * *"   # once a day, 03:00 UTC
+  workflow_dispatch: {}
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330  # stay under GitHub's 360min (6h) hard cap with buffer
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r extractor/requirements.txt
+
+      - name: Run extractor
+        env:
+          ACCOUNT: "vsn"
+          API_ID: ${{ secrets.VSN_API_ID }}
+          API_HASH: ${{ secrets.VSN_API_HASH }}
+          STRING_SESSION: ${{ secrets.VSN_STRING_SESSION }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          BOT_CHAT_ID: ${{ secrets.BOT_CHAT_ID }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
+          DAILY_LIMIT: "50"
+          DELAY_MIN_SECONDS: "1"
+          DELAY_MAX_SECONDS: "4"
+          MAX_NEW_URLS_PER_DIALOG: "5"  # round-robin cap: one busy group can't eat the whole DAILY_LIMIT
+          BATCH_SIZE: "10"
+          BATCH_REST_MIN_MINUTES: "15"
+          BATCH_REST_MAX_MINUTES: "30"
+        working-directory: extractor
+        run: python extract.py
