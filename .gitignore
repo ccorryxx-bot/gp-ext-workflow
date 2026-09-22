@@ -3,3 +3,5 @@ extractor/output/
 *.session
 .env
 .wrangler/
+-e __pycache__/
+*.pyc
