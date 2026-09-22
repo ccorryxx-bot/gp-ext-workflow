@@ -63,10 +63,10 @@ CF_ACCOUNT_ID = os.environ["CF_ACCOUNT_ID"]
 CF_API_TOKEN = os.environ["CF_API_TOKEN"]
 CF_KV_NAMESPACE_ID = os.environ["CF_KV_NAMESPACE_ID"]
 
-# Which Telegram account this run is for (e.g. "vsn", "izm"). Multiple
+# Which Telegram account this run is for (e.g. "vsn", "nch"). Multiple
 # accounts can share one KV namespace + one bot chat: this prefixes every
 # KV key ("<account>:state", "<account>:urls") so their data never
-# collides, and every bot message gets tagged "[VSN]"/"[IZM]" so it's
+# collides, and every bot message gets tagged "[VSN]"/"[NCH]" so it's
 # obvious which account it came from.
 ACCOUNT = os.environ.get("ACCOUNT", "default")
 KV_STATE_KEY = f"{ACCOUNT}:state"

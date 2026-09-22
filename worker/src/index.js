@@ -5,7 +5,7 @@ const REPO = "ccorryxx-bot/gp-ext-workflow";
 // GitHub secrets + a matching .github/workflows/extract-<key>.yml.
 const ACCOUNTS = {
   vsn: { label: "VSN", workflowFile: "extract-vsn.yml" },
-  izm: { label: "IZM", workflowFile: "extract-izm.yml" },
+  nch: { label: "NCH", workflowFile: "extract-nch.yml" },
 };
 
 export default {
@@ -21,7 +21,7 @@ export default {
     }
 
     return new Response(
-      "gp-ext-workflow worker is running.\n\nEndpoints:\n  POST /telegram-webhook  (Telegram only)\n  GET  /urls?account=vsn|izm  (extracted urls)",
+      "gp-ext-workflow worker is running.\n\nEndpoints:\n  POST /telegram-webhook  (Telegram only)\n  GET  /urls?account=vsn|nch  (extracted urls)",
       { status: 200, headers: { "content-type": "text/plain" } }
     );
   },
@@ -66,26 +66,26 @@ async function handleWebhook(request, env) {
       inline_keyboard: [
         [
           { text: "🟦 VSN", callback_data: "extract:vsn" },
-          { text: "🟩 IZM", callback_data: "extract:izm" },
+          { text: "🟩 NCH", callback_data: "extract:nch" },
         ],
         [{ text: "🔀 Both", callback_data: "extract:both" }],
       ],
     });
   } else if (cmd === "/status") {
-    if (arg === "vsn" || arg === "izm") {
+    if (arg === "vsn" || arg === "nch") {
       await reply(env, chatId, await getStatus(env, arg));
     } else {
       const vsn = await getStatus(env, "vsn");
-      const izm = await getStatus(env, "izm");
-      await reply(env, chatId, `${vsn}\n\n----------\n\n${izm}`);
+      const nch = await getStatus(env, "nch");
+      await reply(env, chatId, `${vsn}\n\n----------\n\n${nch}`);
     }
   } else if (cmd === "/help" || cmd === "/start") {
     await reply(
       env,
       chatId,
       "Commands:\n" +
-        "/extract - run extraction now (asks VSN / IZM / Both)\n" +
-        "/status [vsn|izm] - latest run status + total urls (both if no arg)\n" +
+        "/extract - run extraction now (asks VSN / NCH / Both)\n" +
+        "/status [vsn|nch] - latest run status + total urls (both if no arg)\n" +
         "/help - this message"
     );
   } else {
@@ -110,7 +110,7 @@ async function handleCallbackQuery(cq, env) {
     return;
   }
 
-  const targets = target === "both" ? ["vsn", "izm"] : [target];
+  const targets = target === "both" ? ["vsn", "nch"] : [target];
   const validTargets = targets.filter((t) => ACCOUNTS[t]);
 
   if (!validTargets.length) {

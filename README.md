@@ -98,24 +98,24 @@ back to raw regex extraction):
 
 This costs one extra Telegram API call per *new, not-yet-cached* URL.
 
-## Multiple Telegram accounts (VSN / IZM)
+## Multiple Telegram accounts (VSN / NCH)
 
 This repo can run extraction for more than one Telegram account against the
 same bot chat and the same Cloudflare KV namespace:
 
-- Each account gets its own workflow file (`extract-vsn.yml`, `extract-izm.yml`)
+- Each account gets its own workflow file (`extract-vsn.yml`, `extract-nch.yml`)
   and its own `<ACCOUNT>_API_ID` / `<ACCOUNT>_API_HASH` / `<ACCOUNT>_STRING_SESSION`
   GitHub secrets. `BOT_TOKEN`, `BOT_CHAT_ID`, and the `CF_*` KV secrets stay shared.
-- `ACCOUNT` (set per-workflow, e.g. `vsn`/`izm`) prefixes every KV key
-  (`vsn:state`, `vsn:urls`, `izm:state`, `izm:urls`) so the two accounts'
+- `ACCOUNT` (set per-workflow, e.g. `vsn`/`nch`) prefixes every KV key
+  (`vsn:state`, `vsn:urls`, `nch:state`, `nch:urls`) so the two accounts'
   data never collides, and tags every bot message (`[VSN] ...`) so they
   stay distinguishable in the shared chat.
 - Cron times are staggered 30min apart (03:00 / 03:30 UTC) -- not required
   for flood-safety (different Telegram accounts, independent limits), just
   for cleaner monitoring.
-- `/extract` in the bot now asks which account (VSN / IZM / Both) via
-  inline buttons before dispatching; `/status [vsn|izm]` shows one or both.
-- `GET /urls` now requires `?account=vsn` or `?account=izm`.
+- `/extract` in the bot now asks which account (VSN / NCH / Both) via
+  inline buttons before dispatching; `/status [vsn|nch]` shows one or both.
+- `GET /urls` now requires `?account=vsn` or `?account=nch`.
 
 To add a third account: add its 3 `<KEY>_*` secrets, add a
 `.github/workflows/extract-<key>.yml` (copy an existing one, change

@@ -1,4 +1,4 @@
-name: izm_ext_workflow
+name: nch_ext_workflow
 
 on:
   schedule:
@@ -22,10 +22,10 @@ jobs:
 
       - name: Run extractor
         env:
-          ACCOUNT: "izm"
-          API_ID: ${{ secrets.IZM_API_ID }}
-          API_HASH: ${{ secrets.IZM_API_HASH }}
-          STRING_SESSION: ${{ secrets.IZM_STRING_SESSION }}
+          ACCOUNT: "nch"
+          API_ID: ${{ secrets.NCH_API_ID }}
+          API_HASH: ${{ secrets.NCH_API_HASH }}
+          STRING_SESSION: ${{ secrets.NCH_STRING_SESSION }}
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           BOT_CHAT_ID: ${{ secrets.BOT_CHAT_ID }}
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
