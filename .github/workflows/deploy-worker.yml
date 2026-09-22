@@ -10,12 +10,38 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Deploy to Cloudflare Workers
-        uses: cloudflare/wrangler-action@v3
+      - uses: actions/setup-node@v4
         with:
-          apiToken: ${{ secrets.CF_API_TOKEN }}
-          accountId: ${{ secrets.CF_ACCOUNT_ID }}
-          workingDirectory: worker
+          node-version: "20"
+
+      - name: Install wrangler
+        run: npm install -g wrangler
+
+      - name: Deploy worker
+        id: deploy
+        working-directory: worker
+        run: |
+          OUTPUT=$(wrangler deploy)
+          echo "$OUTPUT"
+          WORKER_URL=$(echo "$OUTPUT" | grep -oE 'https://[a-zA-Z0-9.-]+\.workers\.dev' | head -1)
+          echo "worker_url=$WORKER_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Set worker secrets
+        working-directory: worker
+        run: |
+          printf '%s' "${{ secrets.BOT_TOKEN }}"          | wrangler secret put BOT_TOKEN
+          printf '%s' "${{ secrets.BOT_CHAT_ID }}"        | wrangler secret put BOT_CHAT_ID
+          printf '%s' "${{ secrets.GH_DISPATCH_TOKEN }}"  | wrangler secret put GH_PAT
+          printf '%s' "${{ secrets.TG_WEBHOOK_SECRET }}"  | wrangler secret put WEBHOOK_SECRET
+
+      - name: Register Telegram webhook
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.BOT_TOKEN }}/setWebhook" \
+            -d "url=${{ steps.deploy.outputs.worker_url }}/telegram-webhook" \
+            -d "secret_token=${{ secrets.TG_WEBHOOK_SECRET }}"
