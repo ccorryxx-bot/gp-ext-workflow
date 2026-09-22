@@ -39,6 +39,26 @@ The extractor talks to Cloudflare KV directly over its REST API (`requests`),
 so no `wrangler` CLI is needed in that workflow. `wrangler` is only used by
 `deploy-worker.yml` to ship the Worker code itself.
 
+## Round-robin across groups
+
+Each run visits every group (not just the first one it finds new urls in).
+Per group, it stops early once it's collected `MAX_NEW_URLS_PER_DIALOG`
+(default 5) new urls or scanned `MAX_SCAN_PER_DIALOG` (default 300) messages,
+then moves to the next group -- so one very active group can't eat the
+entire `DAILY_LIMIT` and starve quieter groups. Each group's scan position
+(`cursors`) still persists in KV, so it always resumes where it left off.
+
+## Duplicate detection
+
+Duplicates are tracked **per group**, not globally by url text. The same
+url can legitimately show up under several different groups' datasets --
+only a repeat within the *same* group is skipped as a duplicate.
+
+To avoid re-validating the same url once per group it's found in, url
+classification results (`group` / `channel` / `expired` / `invalid`) are
+cached in KV by url text and reused across groups and across runs -- so a
+url shared into 5 groups still only costs 1 Telegram validation call, not 5.
+
 ## URL validation
 
 Every new candidate URL is checked against the live Telegram API before being

@@ -53,6 +53,7 @@ CF_KV_NAMESPACE_ID = os.environ["CF_KV_NAMESPACE_ID"]
 DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "50"))
 DELAY_SECONDS = float(os.environ.get("DELAY_SECONDS", "2"))
 MAX_SCAN_PER_DIALOG = int(os.environ.get("MAX_SCAN_PER_DIALOG", "300"))
+MAX_NEW_URLS_PER_DIALOG = int(os.environ.get("MAX_NEW_URLS_PER_DIALOG", "5"))
 FLOOD_ABORT_SECONDS = int(os.environ.get("FLOOD_ABORT_HOURS", "4")) * 3600
 VALIDATE_URLS = os.environ.get("VALIDATE_URLS", "1") != "0"
 
@@ -263,26 +264,48 @@ def safe_sleep(seconds):
 
 
 def run():
-    state = kv_get("state", {"cursors": {}, "seen_urls": []})
+    state = kv_get("state", {"cursors": {}, "seen_by_group": {}, "url_classifications": {}})
     cursors = state.get("cursors", {})
-    seen_urls = set(state.get("seen_urls", []))
+    # seen_by_group: gid -> set of urls already recorded FOR THAT GROUP.
+    # The same url can exist under multiple groups -- it's only a duplicate
+    # if it was already recorded under *this* group.
+    seen_by_group = {gid: set(urls) for gid, urls in state.get("seen_by_group", {}).items()}
+    # url_classifications: url -> 'group'/'channel'/'expired'/'invalid'/'unknown'.
+    # Cached across groups AND across runs, so the same url shared into 5
+    # different groups only ever costs 1 Telegram validation call, not 5.
+    url_classifications = dict(state.get("url_classifications", {}))
 
     full_dataset = kv_get("urls", {"groups": {}})
     groups_data = full_dataset.get("groups", {})
 
     new_urls_this_run = []
     rejected = {"channel": 0, "expired": 0, "invalid": 0}
+    validation_calls = [0]  # mutable box, just for the final log line
 
     def persist():
-        kv_put("state", {"cursors": cursors, "seen_urls": sorted(seen_urls)})
+        kv_put("state", {
+            "cursors": cursors,
+            "seen_by_group": {gid: sorted(urls) for gid, urls in seen_by_group.items()},
+            "url_classifications": url_classifications,
+        })
         kv_put("urls", {
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "total_groups": len(groups_data),
-            "total_urls": len(seen_urls),
+            "total_urls": sum(len(g.get("urls", [])) for g in groups_data.values()),
             "groups": groups_data,
         })
 
-    notify(f"🚀 Extraction started. Target: {DAILY_LIMIT} new urls.")
+    def classify_cached(client, u):
+        cached = url_classifications.get(u)
+        if cached is not None:
+            return cached  # no API call -- already known, from this run or a past one
+        kind = classify_telegram_url(client, u)
+        url_classifications[u] = kind
+        validation_calls[0] += 1
+        safe_sleep(DELAY_SECONDS)  # only throttle actual new API calls
+        return kind
+
+    notify(f"🚀 Extraction started. Target: {DAILY_LIMIT} new urls, max {MAX_NEW_URLS_PER_DIALOG}/group.")
 
     current_gid = [None]  # mutable box so the except block can see the in-progress group
 
@@ -297,9 +320,15 @@ def run():
                 gid = str(dialog.id)
                 current_gid[0] = gid
                 last_seen_id = cursors.get(gid, 0)
+                gid_seen = seen_by_group.setdefault(gid, set())
                 scanned = 0
+                new_from_this_dialog = 0
 
-                while len(new_urls_this_run) < DAILY_LIMIT and scanned < MAX_SCAN_PER_DIALOG:
+                while (
+                    len(new_urls_this_run) < DAILY_LIMIT
+                    and new_from_this_dialog < MAX_NEW_URLS_PER_DIALOG
+                    and scanned < MAX_SCAN_PER_DIALOG
+                ):
                     try:
                         messages = list(
                             client.iter_messages(dialog, min_id=last_seen_id, reverse=True, limit=20)
@@ -329,34 +358,44 @@ def run():
                         last_seen_id = max(last_seen_id, message.id)
 
                         for u in extract_urls_from_text(message.raw_text):
-                            if u in seen_urls:
-                                continue
+                            if u in gid_seen:
+                                continue  # already recorded for THIS group
 
                             if VALIDATE_URLS:
-                                kind = classify_telegram_url(client, u)
-                                safe_sleep(DELAY_SECONDS)  # rate-limit the validation call too
+                                kind = classify_cached(client, u)
                             else:
-                                kind = "not_telegram"  # skip validation entirely
+                                kind = "not_telegram"
 
                             if kind in ("channel", "expired", "invalid"):
-                                seen_urls.add(u)  # never re-check this one again
+                                gid_seen.add(u)  # never re-check for this group again
                                 rejected[kind] += 1
                                 continue
 
                             # 'group', 'not_telegram', or 'unknown' -- keep it
-                            seen_urls.add(u)
+                            gid_seen.add(u)
                             new_urls_this_run.append(u)
+                            new_from_this_dialog += 1
                             g = groups_data.setdefault(gid, {"group_name": dialog.name, "urls": [], "count": 0})
                             g["urls"].append(u)
                             g["count"] = len(g["urls"])
-                            if len(new_urls_this_run) >= DAILY_LIMIT:
+                            if (
+                                len(new_urls_this_run) >= DAILY_LIMIT
+                                or new_from_this_dialog >= MAX_NEW_URLS_PER_DIALOG
+                            ):
                                 break
 
                         safe_sleep(DELAY_SECONDS)
-                        if len(new_urls_this_run) >= DAILY_LIMIT:
+                        if (
+                            len(new_urls_this_run) >= DAILY_LIMIT
+                            or new_from_this_dialog >= MAX_NEW_URLS_PER_DIALOG
+                        ):
                             break
 
-                    if scanned >= MAX_SCAN_PER_DIALOG or len(new_urls_this_run) >= DAILY_LIMIT:
+                    if (
+                        scanned >= MAX_SCAN_PER_DIALOG
+                        or len(new_urls_this_run) >= DAILY_LIMIT
+                        or new_from_this_dialog >= MAX_NEW_URLS_PER_DIALOG
+                    ):
                         break
 
                 cursors[gid] = last_seen_id
@@ -378,10 +417,11 @@ def run():
         sys.exit(1)
 
     persist()
-    send_results(new_urls_this_run, len(seen_urls), rejected)
+    total_records = sum(len(urls) for urls in seen_by_group.values())
+    send_results(new_urls_this_run, total_records, rejected)
     print(
-        f"DONE: {len(new_urls_this_run)} new urls this run. Total all-time: {len(seen_urls)}. "
-        f"Rejected: {rejected}"
+        f"DONE: {len(new_urls_this_run)} new urls this run. Total (group,url) records: {total_records}. "
+        f"Rejected: {rejected}. Telegram validation API calls this run: {validation_calls[0]}."
     )
 
 

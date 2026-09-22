@@ -31,5 +31,6 @@ jobs:
           CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
           DAILY_LIMIT: "2"  # TEMP: testing, revert to 50
           DELAY_SECONDS: "2"
+          MAX_NEW_URLS_PER_DIALOG: "5"  # round-robin cap: one busy group can't eat the whole DAILY_LIMIT
         working-directory: extractor
         run: python extract.py
