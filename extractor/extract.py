@@ -85,16 +85,28 @@ def kv_put(key, value: dict):
     r.raise_for_status()
 
 
-def notify(text: str):
-    """Fire-and-forget short status ping to the bot chat."""
+def notify(text: str) -> bool:
+    """Status ping to the bot chat. Returns True only if Telegram confirmed
+    delivery (ok:true). Any failure -- network OR Telegram API rejection --
+    is surfaced as a GitHub Actions ::error:: annotation, so a silent bot
+    failure still shows up loudly in the run summary."""
     try:
-        requests.post(
+        r = requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
             json={"chat_id": BOT_CHAT_ID, "text": text, "disable_web_page_preview": True},
             timeout=15,
         )
+        try:
+            data = r.json()
+        except ValueError:
+            data = {}
+        if not r.ok or not data.get("ok"):
+            print(f"::error::Bot ဆီကို message ပို့ မရပါ။ HTTP {r.status_code}: {r.text[:500]}")
+            return False
+        return True
     except requests.RequestException as e:
-        print(f"notify() failed: {e}")
+        print(f"::error::Bot ဆီကို message ပို့ မရပါ (connection error): {type(e).__name__}: {e}")
+        return False
 
 
 def send_results(new_urls, total_seen):
@@ -106,16 +118,31 @@ def send_results(new_urls, total_seen):
     body = "\n".join(new_urls)
     full = header + body
     chunks = [full[i:i + 4000] for i in range(0, len(full), 4000)]
-    for chunk in chunks:
+    failed = 0
+    for idx, chunk in enumerate(chunks):
         try:
-            requests.post(
+            r = requests.post(
                 f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                 json={"chat_id": BOT_CHAT_ID, "text": chunk, "disable_web_page_preview": True},
                 timeout=15,
             )
+            try:
+                data = r.json()
+            except ValueError:
+                data = {}
+            if not r.ok or not data.get("ok"):
+                failed += 1
+                print(f"::error::Bot ဆီကို result chunk {idx+1}/{len(chunks)} ပို့ မရပါ။ HTTP {r.status_code}: {r.text[:500]}")
             time.sleep(1)
         except requests.RequestException as e:
-            print(f"send_results() failed: {e}")
+            failed += 1
+            print(f"::error::Bot ဆီကို result chunk {idx+1}/{len(chunks)} ပို့ မရပါ (connection error): {type(e).__name__}: {e}")
+    if failed:
+        # URLs were still found and persisted to KV -- only the Telegram delivery
+        # failed. Fail the Actions run too, so it doesn't look green when the
+        # bot never got the results.
+        print(f"::error::{failed}/{len(chunks)} chunk(s) Bot ဆီ ပို့ မရပါ -- KV ထဲ url တွေက ရေးထားပြီးသား ဖြစ်ပေမယ့် Bot notify သာ fail တာပါ။")
+        sys.exit(1)
 
 
 def safe_sleep(seconds):
@@ -234,5 +261,10 @@ if __name__ == "__main__":
     except SystemExit:
         raise
     except Exception as e:
-        notify(f"❌ Error ကြောင့် workflow ရပ်သွားပါတယ်:\n{type(e).__name__}: {e}")
+        err_msg = f"{type(e).__name__}: {e}"
+        # Print first -- this line shows up in the Actions run summary even
+        # if the bot notify below also fails, so a fully silent failure
+        # (no bot message AND nothing visible) is no longer possible.
+        print(f"::error::Action ရပ်သွားခဲ့သည်, ဘာဖြစ်လို့ error: {err_msg}")
+        notify(f"❌ Error ကြောင့် workflow ရပ်သွားပါတယ်:\n{err_msg}")
         raise
