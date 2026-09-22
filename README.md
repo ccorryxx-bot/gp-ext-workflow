@@ -8,17 +8,17 @@ Cloudflare KV, and serves them via a Cloudflare Worker HTTP endpoint.
 ```
 GitHub Actions (cron, once daily)
     -> extractor/extract.py  (Telethon, logs in with STRING_SESSION)
-       - reads "state" (cursors + seen_urls) from Cloudflare KV via REST API
-       - scans groups from where it left off last time
+       - reads "state" (cursors + seen_by_group + url_classifications) from
+         Cloudflare KV via REST API
+       - scans groups from where it left off last time, round-robin (see below)
        - for each new candidate url, resolves it against the live Telegram
          API (CheckChatInviteRequest / get_entity) and classifies it:
          group (kept), channel (dropped), expired/invalid invite (dropped)
        - stops once 50 NEW *group* urls are found (DAILY_LIMIT)
-       - 2s delay between messages, and 2s delay after each validation call
-       - catches FloodWaitError and sleeps
+       - randomized delay between messages/validation calls, catches FloodWaitError
        - writes updated "state" and "urls" back to KV via REST API
-       - sends the day's new urls to your Telegram Bot chat, with a summary
-         of how many channel/expired/invalid links were filtered out
+       - delivers new urls to your Telegram Bot chat in batches, with a long
+         rest between batches (see "Delivery pacing" below)
 
 Cloudflare Worker (worker/src/index.js)
     -> GET /urls             reads "urls" key from KV, serves JSON
@@ -30,14 +30,39 @@ The extractor runs on GitHub's runners, not inside the Worker, because the Worke
 runtime cannot hold the persistent MTProto connection Telegram's client API needs.
 
 KV is used for two things:
-- `state` — cursor per group (last message id processed) + the full set of
-  URLs already seen, so each run only pulls what's new and never re-sends
-  a duplicate.
+- `state` — cursor per group (last message id processed), the set of urls
+  already recorded per group, and a url→classification cache, so each run
+  only pulls what's new and never re-sends a duplicate.
 - `urls` — the full published dataset the Worker serves over HTTP.
 
 The extractor talks to Cloudflare KV directly over its REST API (`requests`),
 so no `wrangler` CLI is needed in that workflow. `wrangler` is only used by
 `deploy-worker.yml` to ship the Worker code itself.
+
+## Delivery pacing
+
+New urls are pushed to the bot in batches of `BATCH_SIZE` (default 10) as
+they're found, with a randomized rest of `BATCH_REST_MIN_MINUTES` to
+`BATCH_REST_MAX_MINUTES` (default 15–30 min) before the next batch --
+instead of scanning everything first and dumping all 50 at the end. This
+breaks up the request burst pattern; Telegram's flood detection cares more
+about volume-in-a-short-window than sub-second timing. Per-message and
+per-validation-call pacing is also randomized (`DELAY_MIN_SECONDS`–
+`DELAY_MAX_SECONDS`, default 1–4s) instead of a fixed delay.
+
+A full `DAILY_LIMIT=50` run therefore normally takes roughly 1.5–2h
+(mostly the batch rests), well inside the job's `timeout-minutes: 330`
+safety cap (GitHub's hard limit is 360min/6h). Note: in a pathological case
+-- many groups with zero matching urls, each scanned to its full
+`MAX_SCAN_PER_DIALOG` -- the scanning phase itself could still run long;
+the job timeout exists as a backstop for that.
+
+If a run is interrupted (FloodWait abort, PeerFlood, or the job timeout),
+whatever's already been found and validated is flushed to the bot and
+persisted to KV before it exits.
+
+Each batch (and the final summary) is sent as a native-monospace,
+tap-to-copy bracketed list: `[https://t.me/a,https://t.me/b,...]`.
 
 ## Round-robin across groups
 
@@ -71,8 +96,7 @@ back to raw regex extraction):
 - Either way, if it resolves to a broadcast channel (not a group/megagroup) → dropped as `channel`.
 - Non-Telegram URLs pass through unvalidated (kept as-is).
 
-This costs one extra Telegram API call per *new* URL, so it's worth keeping
-`DAILY_LIMIT` reasonable -- it's on top of the message-scanning calls.
+This costs one extra Telegram API call per *new, not-yet-cached* URL.
 
 ## One-time setup
 

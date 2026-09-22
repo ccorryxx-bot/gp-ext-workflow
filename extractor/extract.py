@@ -3,9 +3,20 @@ gp-ext-workflow extractor (Command & Control version)
 
 - Triggered either by GitHub Actions cron OR by a Telegram Bot command
   ("/extract") relayed through the Cloudflare Worker webhook.
-- Extracts at most DAILY_LIMIT *new* URLs per run, resuming per-group from
-  where it left off (cursor persisted in Cloudflare KV).
-- 2s delay between messages read.
+- Extracts at most DAILY_LIMIT *new* group URLs per run, capped per-group at
+  MAX_NEW_URLS_PER_DIALOG (round-robin -- one busy group can't starve the
+  rest), resuming per-group from where it left off (cursor in Cloudflare KV).
+- Every candidate url is resolved against the live Telegram API and only
+  kept if it's a group/megagroup (not a broadcast channel, not an
+  expired/invalid invite). Duplicate tracking + the validation-result cache
+  are per-group and cross-run (see classify_telegram_url / classify_cached).
+- Randomized delay (DELAY_MIN_SECONDS-DELAY_MAX_SECONDS) between messages
+  and validation calls.
+- New urls are delivered to the bot in batches of BATCH_SIZE, with a long
+  randomized rest (BATCH_REST_MIN_MINUTES-BATCH_REST_MAX_MINUTES) between
+  batches, instead of one big dump at the end -- breaks up the request
+  burst pattern. Delivered as a native-monospace, tap-to-copy bracketed
+  list: [https://a,https://b,...]
 - FloodWaitError handling (has a known wait time):
     * wait <= FLOOD_ABORT_SECONDS (default 4h): sleep it out, notify if long.
     * wait  > FLOOD_ABORT_SECONDS: save progress, notify with resume time,
@@ -15,7 +26,7 @@ gp-ext-workflow extractor (Command & Control version)
   there's no ETA, and abort immediately. Retrying soon will not help.
 - Any unhandled error: notify the bot with the error, then exit 1 so the
   GitHub Actions run is also marked failed.
-- Sends a start ping and a final summary (with the new URLs) to the bot.
+- Sends a start ping, one message per delivered batch, and a final summary.
 """
 
 import os
@@ -23,6 +34,8 @@ import re
 import sys
 import json
 import time
+import html
+import random
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -51,11 +64,20 @@ CF_API_TOKEN = os.environ["CF_API_TOKEN"]
 CF_KV_NAMESPACE_ID = os.environ["CF_KV_NAMESPACE_ID"]
 
 DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "50"))
-DELAY_SECONDS = float(os.environ.get("DELAY_SECONDS", "2"))
+# Per-message/per-validation-call pacing is randomized within this range
+# instead of a fixed delay, so the request rhythm doesn't look scripted.
+DELAY_MIN_SECONDS = float(os.environ.get("DELAY_MIN_SECONDS", os.environ.get("DELAY_SECONDS", "1")))
+DELAY_MAX_SECONDS = float(os.environ.get("DELAY_MAX_SECONDS", "4"))
 MAX_SCAN_PER_DIALOG = int(os.environ.get("MAX_SCAN_PER_DIALOG", "300"))
 MAX_NEW_URLS_PER_DIALOG = int(os.environ.get("MAX_NEW_URLS_PER_DIALOG", "5"))
 FLOOD_ABORT_SECONDS = int(os.environ.get("FLOOD_ABORT_HOURS", "4")) * 3600
 VALIDATE_URLS = os.environ.get("VALIDATE_URLS", "1") != "0"
+
+# Delivery pacing: new urls are pushed to the bot in batches, with a long
+# human-like rest between batches, instead of one big dump at the end.
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "10"))
+BATCH_REST_MIN_SECONDS = int(os.environ.get("BATCH_REST_MIN_MINUTES", "15")) * 60
+BATCH_REST_MAX_SECONDS = int(os.environ.get("BATCH_REST_MAX_MINUTES", "30")) * 60
 
 URL_REGEX = re.compile(
     r'(?:https?://|www\.|t\.me/|telegram\.me/)[^\s<>"\')\]]+',
@@ -187,17 +209,16 @@ def kv_put(key, value: dict):
     r.raise_for_status()
 
 
-def notify(text: str) -> bool:
-    """Status ping to the bot chat. Returns True only if Telegram confirmed
-    delivery (ok:true). Any failure -- network OR Telegram API rejection --
-    is surfaced as a GitHub Actions ::error:: annotation, so a silent bot
+def _send_telegram_message(text: str, parse_mode: str | None = None) -> bool:
+    """Low-level sender. Returns True only if Telegram confirmed delivery
+    (ok:true). Any failure -- network OR Telegram API rejection -- is
+    surfaced as a GitHub Actions ::error:: annotation, so a silent bot
     failure still shows up loudly in the run summary."""
+    payload = {"chat_id": BOT_CHAT_ID, "text": text, "disable_web_page_preview": True}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
     try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={"chat_id": BOT_CHAT_ID, "text": text, "disable_web_page_preview": True},
-            timeout=15,
-        )
+        r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json=payload, timeout=15)
         try:
             data = r.json()
         except ValueError:
@@ -211,56 +232,71 @@ def notify(text: str) -> bool:
         return False
 
 
-def send_results(new_urls, total_seen, rejected=None):
-    rejected = rejected or {}
-    filtered_note = ""
-    if any(rejected.values()):
-        filtered_note = (
-            f"\n🧹 Filtered out -- channel: {rejected.get('channel', 0)}, "
-            f"expired: {rejected.get('expired', 0)}, invalid: {rejected.get('invalid', 0)}"
-        )
+def notify(text: str) -> bool:
+    """Plain-text status ping to the bot chat."""
+    return _send_telegram_message(text)
 
-    if not new_urls:
-        notify(f"✅ Run complete. No new urls found this time. Total all-time: {total_seen}.{filtered_note}")
-        return
 
-    header = (
-        f"✅ Done: {len(new_urls)} new URL(s) (cap {DAILY_LIMIT}). "
-        f"Total all-time: {total_seen}{filtered_note}\n\n"
-    )
-    body = "\n".join(new_urls)
-    full = header + body
-    chunks = [full[i:i + 4000] for i in range(0, len(full), 4000)]
-    failed = 0
+def _chunk_urls_by_length(urls, max_len=3500):
+    """Group urls into chunks whose bracketed-list rendering stays under
+    Telegram's 4096-char message cap (max_len leaves headroom for the
+    <code> wrapper and any header text)."""
+    chunks, current, current_len = [], [], 2  # 2 == the "[" "]"
+    for u in urls:
+        add_len = len(u) + (1 if current else 0)  # +1 for the joining comma
+        if current and current_len + add_len > max_len:
+            chunks.append(current)
+            current, current_len = [], 2
+        current.append(u)
+        current_len += add_len
+    if current:
+        chunks.append(current)
+    return chunks or [[]]
+
+
+def send_url_batch(urls, header: str | None = None) -> bool:
+    """Push a batch of urls to the bot as a native-monospace, tap-to-copy
+    bracketed list: [https://a,https://b,https://c]. Returns False (and
+    logs ::error::) if ANY chunk fails to deliver -- caller decides whether
+    that should fail the run."""
+    if not urls:
+        if header:
+            return notify(header)
+        return True
+
+    ok_all = True
+    chunks = _chunk_urls_by_length(urls)
     for idx, chunk in enumerate(chunks):
-        try:
-            r = requests.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                json={"chat_id": BOT_CHAT_ID, "text": chunk, "disable_web_page_preview": True},
-                timeout=15,
-            )
-            try:
-                data = r.json()
-            except ValueError:
-                data = {}
-            if not r.ok or not data.get("ok"):
-                failed += 1
-                print(f"::error::Bot ဆီကို result chunk {idx+1}/{len(chunks)} ပို့ မရပါ။ HTTP {r.status_code}: {r.text[:500]}")
-            time.sleep(1)
-        except requests.RequestException as e:
-            failed += 1
-            print(f"::error::Bot ဆီကို result chunk {idx+1}/{len(chunks)} ပို့ မရပါ (connection error): {type(e).__name__}: {e}")
-    if failed:
-        # URLs were still found and persisted to KV -- only the Telegram delivery
-        # failed. Fail the Actions run too, so it doesn't look green when the
-        # bot never got the results.
-        print(f"::error::{failed}/{len(chunks)} chunk(s) Bot ဆီ ပို့ မရပါ -- KV ထဲ url တွေက ရေးထားပြီးသား ဖြစ်ပေမယ့် Bot notify သာ fail တာပါ။")
-        sys.exit(1)
+        body = "[" + ",".join(chunk) + "]"
+        text = f"<code>{html.escape(body)}</code>"
+        if header and idx == 0:
+            text = f"{html.escape(header)}\n\n{text}"
+        ok = _send_telegram_message(text, parse_mode="HTML")
+        if not ok:
+            print(f"::error::Url batch chunk {idx+1}/{len(chunks)} ({len(chunk)} url(s)) Bot ဆီ ပို့ မရပါ။")
+        ok_all = ok_all and ok
+        time.sleep(1)
+    return ok_all
 
 
 def safe_sleep(seconds):
     if seconds > 0:
         time.sleep(seconds)
+
+
+def jitter_sleep():
+    """Randomized pacing for message/validation calls -- avoids a fixed,
+    scriptable rhythm between requests."""
+    safe_sleep(random.uniform(DELAY_MIN_SECONDS, DELAY_MAX_SECONDS))
+
+
+def batch_rest_sleep():
+    """Long human-like pause between delivered batches."""
+    seconds = random.uniform(BATCH_REST_MIN_SECONDS, BATCH_REST_MAX_SECONDS)
+    print(f"Resting {seconds/60:.1f} min before next batch...")
+    time.sleep(seconds)
+
+
 
 
 def run():
@@ -302,8 +338,28 @@ def run():
         kind = classify_telegram_url(client, u)
         url_classifications[u] = kind
         validation_calls[0] += 1
-        safe_sleep(DELAY_SECONDS)  # only throttle actual new API calls
+        jitter_sleep()  # only throttle actual new API calls
         return kind
+
+    pending_batch = []
+    batch_counter = [0]
+
+    def flush_pending_batch():
+        """Push whatever's queued to the bot right now, as its own batch."""
+        if not pending_batch:
+            return
+        batch_counter[0] += 1
+        header = (
+            f"📦 Batch {batch_counter[0]} -- {len(pending_batch)} url(s) "
+            f"(running total: {len(new_urls_this_run)}/{DAILY_LIMIT})"
+        )
+        ok = send_url_batch(pending_batch, header=header)
+        if not ok:
+            print(
+                f"::error::Batch {batch_counter[0]} ({len(pending_batch)} url(s)) Bot ဆီ ပို့ မရပါ -- "
+                f"KV ထဲ ရေးထားပြီးသားပါ, Bot notify သာ fail တာပါ။"
+            )
+        pending_batch.clear()
 
     notify(f"🚀 Extraction started. Target: {DAILY_LIMIT} new urls, max {MAX_NEW_URLS_PER_DIALOG}/group.")
 
@@ -336,10 +392,11 @@ def run():
                     except FloodWaitError as e:
                         if e.seconds > FLOOD_ABORT_SECONDS:
                             resume_at = datetime.now(timezone.utc) + timedelta(seconds=e.seconds)
+                            flush_pending_batch()
                             notify(
-                                f"⚠️ FloodWait {e.seconds}s (~{e.seconds/3600:.1f}h) ကြုံရပါတယ်.\n"
-                                f"{FLOOD_ABORT_SECONDS // 3600}h ကျော်လို့ workflow ကို ရပ်လိုက်ပါပြီ။\n"
-                                f"ခန့်မှန်း resume time: {resume_at.strftime('%Y-%m-%d %H:%M UTC')}"
+                                f"⚠️ Flood wait -{e.seconds}s (~{e.seconds/3600:.1f}h) ကြုံရပါတယ်.\n"
+                                f"{FLOOD_ABORT_SECONDS // 3600}h ကျော်လို့ workflow ကို ရပ်လိုက်ပါပြီ။🎯\n"
+                                f"Resume ဖြစ်မည့် အချိန်: {resume_at.strftime('%Y-%m-%d %H:%M UTC')}"
                             )
                             cursors[gid] = last_seen_id
                             persist()
@@ -378,13 +435,20 @@ def run():
                             g = groups_data.setdefault(gid, {"group_name": dialog.name, "urls": [], "count": 0})
                             g["urls"].append(u)
                             g["count"] = len(g["urls"])
+
+                            pending_batch.append(u)
+                            if len(pending_batch) >= BATCH_SIZE:
+                                flush_pending_batch()
+                                if len(new_urls_this_run) < DAILY_LIMIT:
+                                    batch_rest_sleep()
+
                             if (
                                 len(new_urls_this_run) >= DAILY_LIMIT
                                 or new_from_this_dialog >= MAX_NEW_URLS_PER_DIALOG
                             ):
                                 break
 
-                        safe_sleep(DELAY_SECONDS)
+                        jitter_sleep()
                         if (
                             len(new_urls_this_run) >= DAILY_LIMIT
                             or new_from_this_dialog >= MAX_NEW_URLS_PER_DIALOG
@@ -407,6 +471,7 @@ def run():
         # no ETA. Save whatever progress we made and stop the whole run.
         if current_gid[0]:
             cursors[current_gid[0]] = cursors.get(current_gid[0], 0)
+        flush_pending_batch()
         persist()
         notify(
             "🚫 Peer Flood ကြုံရပါတယ်.\n"
@@ -416,9 +481,20 @@ def run():
         )
         sys.exit(1)
 
+    flush_pending_batch()
     persist()
     total_records = sum(len(urls) for urls in seen_by_group.values())
-    send_results(new_urls_this_run, total_records, rejected)
+    filtered_note = ""
+    if any(rejected.values()):
+        filtered_note = (
+            f"\n🧹 Filtered out -- channel: {rejected.get('channel', 0)}, "
+            f"expired: {rejected.get('expired', 0)}, invalid: {rejected.get('invalid', 0)}"
+        )
+    notify(
+        f"✅ Run complete -- {len(new_urls_this_run)} new url(s) sent across "
+        f"{batch_counter[0]} batch(es). Total (group,url) records: {total_records}."
+        f"{filtered_note}"
+    )
     print(
         f"DONE: {len(new_urls_this_run)} new urls this run. Total (group,url) records: {total_records}. "
         f"Rejected: {rejected}. Telegram validation API calls this run: {validation_calls[0]}."
