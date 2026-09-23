@@ -124,58 +124,95 @@ def extract_urls_from_text(text):
     return [clean_url(u) for u in URL_REGEX.findall(text)]
 
 
-def get_member_count(client, obj):
-    """obj is either a types.ChatInvite (not-yet-joined invite info -- the
-    count is already embedded, free) or a resolved Chat/Channel entity
-    (Chat has it embedded too; Channel needs one more API call via
-    GetFullChannelRequest). Returns int, or None if it couldn't be
-    determined (network/flood/permission issue -- caller decides what to
-    do with an unknown count)."""
+MYANMAR_SCRIPT_RE = re.compile(r'[\u1000-\u109F\uAA60-\uAA7F\uA9E0-\uA9FF]')
+
+
+def looks_myanmar(text):
+    """True/False if text has/lacks Myanmar-script characters, None if
+    there's no text to judge from at all (title+about both empty)."""
+    if not text or not text.strip():
+        return None
+    return bool(MYANMAR_SCRIPT_RE.search(text))
+
+
+def get_group_details(client, obj):
+    """obj is either a types.ChatInvite (not-yet-joined invite -- title,
+    about, and participants_count are all already embedded in it, free) or
+    a resolved Chat/Channel entity. Chat has participants_count embedded
+    but not `about` (would need a further GetFullChatRequest -- skipped,
+    rare case, falls back to title-only language detection). Channel needs
+    one GetFullChannelRequest for BOTH participants_count and about
+    together -- one extra call covers both the member-count and the
+    language filters, not two.
+
+    Returns (members, about) -- either can be None if undeterminable."""
     if isinstance(obj, types.ChatInvite):
-        return getattr(obj, "participants_count", None)
+        return getattr(obj, "participants_count", None), getattr(obj, "about", None)
     if isinstance(obj, types.Chat):
-        return getattr(obj, "participants_count", None)
+        return getattr(obj, "participants_count", None), None
     if isinstance(obj, types.Channel):
         try:
             full = client(functions.channels.GetFullChannelRequest(obj))
-            return full.full_chat.participants_count
+            return full.full_chat.participants_count, full.full_chat.about
         except FloodWaitError as e:
             if e.seconds <= 60:
                 safe_sleep(e.seconds)
                 try:
                     full = client(functions.channels.GetFullChannelRequest(obj))
-                    return full.full_chat.participants_count
+                    return full.full_chat.participants_count, full.full_chat.about
                 except Exception:
-                    return None
-            return None
+                    return None, None
+            return None, None
         except Exception:
-            return None
-    return None
+            return None, None
+    return None, None
+
+
+MYANMAR_ONLY = os.environ.get("MYANMAR_ONLY", "1") != "0"
+
+
+def _decide_kind(members, about, title):
+    """Shared decision for every 'confirmed group' branch below: member
+    threshold first, then Myanmar-script presence in title+about. Neither
+    check can produce a false DROP from missing data -- None/unknown always
+    falls through to keeping it, per the same policy as the member-count
+    check (see classify_telegram_url docstring)."""
+    if members is not None and members <= MIN_GROUP_MEMBERS:
+        return "small_group"
+    if MYANMAR_ONLY:
+        is_mm = looks_myanmar(f"{title or ''} {about or ''}")
+        if is_mm is False:
+            return "not_myanmar"
+    return "group"
 
 
 def classify_telegram_url(client, url):
     """Resolve a Telegram link against the live API and classify it.
 
     Returns a dict {"kind": <str>, "members": <int|None>}. kind is one of:
-      'group'        -- confirmed group/megagroup, > MIN_GROUP_MEMBERS -- KEEP
+      'group'        -- confirmed group/megagroup, passes member+language filters -- KEEP
       'small_group'   -- confirmed group/megagroup, <= MIN_GROUP_MEMBERS -- DROP
+      'not_myanmar'   -- confirmed group/megagroup, title+about has no Myanmar script -- DROP
       'channel'       -- confirmed broadcast channel -- DROP
       'expired'       -- private invite link, expired/revoked -- DROP
       'invalid'       -- link doesn't resolve to anything real -- DROP
       'not_telegram'  -- not a t.me/telegram.me link at all -- KEEP as-is (unvalidated)
       'unknown'       -- resolution failed for a transient reason (flood, etc) -- KEEP, unverified
 
-    A member count that couldn't be determined (members=None, e.g. the
-    GetFullChannelRequest call itself failed) is treated as 'group' rather
-    than dropped -- we'd rather keep an unverified url than lose real data
-    to a transient lookup failure. Only a *confirmed* count at or under
-    MIN_GROUP_MEMBERS is dropped as 'small_group'.
+    A member count OR Myanmar-script presence that couldn't be determined
+    (missing data / a lookup call itself failed) is treated as passing
+    rather than dropped -- we'd rather keep an unverified url than lose
+    real data to a transient/missing-data issue. Only a *confirmed* small
+    count or *confirmed* non-Myanmar title+about gets dropped. Set
+    MYANMAR_ONLY=0 to disable the language filter entirely (member-count
+    filtering still applies).
 
     Costs one extra Telegram API call per *new* candidate URL for the
-    group/channel check, PLUS one more for the member-count lookup unless
-    it's a not-yet-joined private invite link (that count comes for free).
-    Both are skipped entirely for URLs already in `seen_urls`, and
-    skippable globally via VALIDATE_URLS=0.
+    group/channel check, PLUS one more (GetFullChannelRequest) that covers
+    BOTH the member-count and the language checks together, unless it's a
+    not-yet-joined private invite link (that response already has
+    everything for free). Both are skipped entirely for URLs already in
+    `seen_urls`, and skippable globally via VALIDATE_URLS=0.
     """
     m = TG_INVITE_HASH_REGEX.search(url)
     if m:
@@ -204,14 +241,14 @@ def classify_telegram_url(client, url):
             if getattr(chat, "broadcast", False):
                 return {"kind": "channel", "members": None}
             jitter_sleep()
-            members = get_member_count(client, chat)
-            kind = "small_group" if (members is not None and members <= MIN_GROUP_MEMBERS) else "group"
+            members, about = get_group_details(client, chat)
+            kind = _decide_kind(members, about, getattr(chat, "title", None))
             return {"kind": kind, "members": members}
         if isinstance(result, types.ChatInvite):
             if getattr(result, "broadcast", False):
                 return {"kind": "channel", "members": None}
-            members = get_member_count(client, result)  # free -- already in the response
-            kind = "small_group" if (members is not None and members <= MIN_GROUP_MEMBERS) else "group"
+            members, about = get_group_details(client, result)  # free -- already in the response
+            kind = _decide_kind(members, about, getattr(result, "title", None))
             return {"kind": kind, "members": members}
         return {"kind": "unknown", "members": None}
 
@@ -243,12 +280,12 @@ def classify_telegram_url(client, url):
             if entity.broadcast:
                 return {"kind": "channel", "members": None}
             jitter_sleep()
-            members = get_member_count(client, entity)
-            kind = "small_group" if (members is not None and members <= MIN_GROUP_MEMBERS) else "group"
+            members, about = get_group_details(client, entity)
+            kind = _decide_kind(members, about, getattr(entity, "title", None))
             return {"kind": kind, "members": members}
         if isinstance(entity, types.Chat):
-            members = get_member_count(client, entity)  # free -- embedded on Chat
-            kind = "small_group" if (members is not None and members <= MIN_GROUP_MEMBERS) else "group"
+            members, about = get_group_details(client, entity)  # free -- embedded on Chat
+            kind = _decide_kind(members, about, getattr(entity, "title", None))
             return {"kind": kind, "members": members}
         return {"kind": "invalid", "members": None}  # resolved to a User or something else
 
@@ -403,7 +440,7 @@ def run():
     groups_data = full_dataset.get("groups", {})
 
     new_urls_this_run = []
-    rejected = {"channel": 0, "expired": 0, "invalid": 0, "small_group": 0}
+    rejected = {"channel": 0, "expired": 0, "invalid": 0, "small_group": 0, "not_myanmar": 0}
     validation_calls = [0]  # mutable box, just for the final log line
 
     def persist():
@@ -517,7 +554,7 @@ def run():
                                 result = {"kind": "not_telegram", "members": None}
                             kind, members = result["kind"], result["members"]
 
-                            if kind in ("channel", "expired", "invalid", "small_group"):
+                            if kind in ("channel", "expired", "invalid", "small_group", "not_myanmar"):
                                 gid_seen.add(u)  # never re-check for this group again
                                 rejected[kind] += 1
                                 continue
@@ -585,6 +622,7 @@ def run():
         filtered_note = (
             f"\n🧹 Filtered out -- channel: {rejected.get('channel', 0)}, "
             f"small_group (≤{MIN_GROUP_MEMBERS}): {rejected.get('small_group', 0)}, "
+            f"not_myanmar: {rejected.get('not_myanmar', 0)}, "
             f"expired: {rejected.get('expired', 0)}, invalid: {rejected.get('invalid', 0)}"
         )
     notify_status(

@@ -99,13 +99,23 @@ back to raw regex extraction):
   `small_group`. A count that couldn't be determined (transient API failure)
   is treated as passing, not dropped -- see the docstring on
   `classify_telegram_url` for the reasoning.
+- If `MYANMAR_ONLY=1` (default), its title+about are checked for Myanmar
+  script (Unicode U+1000-U+109F etc). No Myanmar characters found → dropped
+  as `not_myanmar`. No title/about text to judge from → treated as passing,
+  not dropped, same reasoning as the member-count case. Set `MYANMAR_ONLY=0`
+  to turn this off (member-count filtering still applies). This is a script
+  check, not language detection -- Myanmar's script is its own Unicode
+  block with zero overlap with Latin/Cyrillic, so a simple character-range
+  check is both faster and more reliable here than a language-ID library.
 - Non-Telegram URLs pass through unvalidated (kept as-is).
 
-Member counts come free for not-yet-joined private invite links (embedded
-in the `CheckChatInviteRequest` response); everything else needs one more
-API call (`GetFullChannelRequest`) on top of the group/channel check. Both
-calls (and their results) are cached per url in `url_classifications`, so
-repeats -- within a run or across days -- cost nothing extra.
+Member counts and the about text both come free for not-yet-joined private
+invite links (embedded in the `CheckChatInviteRequest` response); for
+everything else, one `GetFullChannelRequest` call covers BOTH the
+member-count and language checks together -- not two separate calls. All
+of this (including the Myanmar-script result) is cached per url in
+`url_classifications`, so repeats -- within a run, across groups, across
+days -- cost nothing extra.
 
 The `urls` KV dataset stores each entry as `{"url": ..., "members": N}`
 (not a bare string) so member counts are queryable later --
