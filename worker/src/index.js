@@ -238,7 +238,10 @@ async function handleUrls(request, env) {
 
   const q = url.searchParams.get("q");
   const group = url.searchParams.get("group");
+  const minMembers = url.searchParams.get("min_members");
   let groups = data.groups;
+
+  const urlOf = (entry) => (typeof entry === "string" ? entry : entry.url);
 
   if (group) {
     groups = Object.fromEntries(
@@ -248,7 +251,16 @@ async function handleUrls(request, env) {
   if (q) {
     const filtered = {};
     for (const [gid, g] of Object.entries(groups)) {
-      const matches = g.urls.filter((u) => u.toLowerCase().includes(q.toLowerCase()));
+      const matches = g.urls.filter((entry) => urlOf(entry).toLowerCase().includes(q.toLowerCase()));
+      if (matches.length) filtered[gid] = { ...g, urls: matches, count: matches.length };
+    }
+    groups = filtered;
+  }
+  if (minMembers) {
+    const min = Number(minMembers);
+    const filtered = {};
+    for (const [gid, g] of Object.entries(groups)) {
+      const matches = g.urls.filter((entry) => typeof entry === "object" && entry.members != null && entry.members >= min);
       if (matches.length) filtered[gid] = { ...g, urls: matches, count: matches.length };
     }
     groups = filtered;

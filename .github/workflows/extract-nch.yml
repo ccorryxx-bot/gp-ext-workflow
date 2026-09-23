@@ -35,6 +35,7 @@ jobs:
           DELAY_MIN_SECONDS: "1"
           DELAY_MAX_SECONDS: "4"
           MAX_NEW_URLS_PER_DIALOG: "5"  # round-robin cap: one busy group can't eat the whole DAILY_LIMIT
+          MIN_GROUP_MEMBERS: "1500"
           BATCH_SIZE: "10"
           BATCH_REST_MIN_MINUTES: "15"
           BATCH_REST_MAX_MINUTES: "30"

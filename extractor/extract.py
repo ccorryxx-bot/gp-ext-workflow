@@ -81,6 +81,9 @@ MAX_SCAN_PER_DIALOG = int(os.environ.get("MAX_SCAN_PER_DIALOG", "300"))
 MAX_NEW_URLS_PER_DIALOG = int(os.environ.get("MAX_NEW_URLS_PER_DIALOG", "5"))
 FLOOD_ABORT_SECONDS = int(os.environ.get("FLOOD_ABORT_HOURS", "4")) * 3600
 VALIDATE_URLS = os.environ.get("VALIDATE_URLS", "1") != "0"
+# Only keep group urls with MORE than this many members. None/unknown member
+# counts (lookup failed) are kept rather than dropped -- see get_member_count.
+MIN_GROUP_MEMBERS = int(os.environ.get("MIN_GROUP_MEMBERS", "1500"))
 
 # Delivery pacing: new urls are pushed to the bot in batches, with a long
 # human-like rest between batches, instead of one big dump at the end.
@@ -121,20 +124,58 @@ def extract_urls_from_text(text):
     return [clean_url(u) for u in URL_REGEX.findall(text)]
 
 
+def get_member_count(client, obj):
+    """obj is either a types.ChatInvite (not-yet-joined invite info -- the
+    count is already embedded, free) or a resolved Chat/Channel entity
+    (Chat has it embedded too; Channel needs one more API call via
+    GetFullChannelRequest). Returns int, or None if it couldn't be
+    determined (network/flood/permission issue -- caller decides what to
+    do with an unknown count)."""
+    if isinstance(obj, types.ChatInvite):
+        return getattr(obj, "participants_count", None)
+    if isinstance(obj, types.Chat):
+        return getattr(obj, "participants_count", None)
+    if isinstance(obj, types.Channel):
+        try:
+            full = client(functions.channels.GetFullChannelRequest(obj))
+            return full.full_chat.participants_count
+        except FloodWaitError as e:
+            if e.seconds <= 60:
+                safe_sleep(e.seconds)
+                try:
+                    full = client(functions.channels.GetFullChannelRequest(obj))
+                    return full.full_chat.participants_count
+                except Exception:
+                    return None
+            return None
+        except Exception:
+            return None
+    return None
+
+
 def classify_telegram_url(client, url):
     """Resolve a Telegram link against the live API and classify it.
 
-    Returns one of:
-      'group'        -- confirmed group/megagroup, not expired -- KEEP
+    Returns a dict {"kind": <str>, "members": <int|None>}. kind is one of:
+      'group'        -- confirmed group/megagroup, > MIN_GROUP_MEMBERS -- KEEP
+      'small_group'   -- confirmed group/megagroup, <= MIN_GROUP_MEMBERS -- DROP
       'channel'       -- confirmed broadcast channel -- DROP
       'expired'       -- private invite link, expired/revoked -- DROP
       'invalid'       -- link doesn't resolve to anything real -- DROP
       'not_telegram'  -- not a t.me/telegram.me link at all -- KEEP as-is (unvalidated)
       'unknown'       -- resolution failed for a transient reason (flood, etc) -- KEEP, unverified
 
-    Costs exactly one extra Telegram API call per *new* candidate URL (skipped
-    entirely for URLs already in `seen_urls`, and skippable globally via
-    VALIDATE_URLS=0).
+    A member count that couldn't be determined (members=None, e.g. the
+    GetFullChannelRequest call itself failed) is treated as 'group' rather
+    than dropped -- we'd rather keep an unverified url than lose real data
+    to a transient lookup failure. Only a *confirmed* count at or under
+    MIN_GROUP_MEMBERS is dropped as 'small_group'.
+
+    Costs one extra Telegram API call per *new* candidate URL for the
+    group/channel check, PLUS one more for the member-count lookup unless
+    it's a not-yet-joined private invite link (that count comes for free).
+    Both are skipped entirely for URLs already in `seen_urls`, and
+    skippable globally via VALIDATE_URLS=0.
     """
     m = TG_INVITE_HASH_REGEX.search(url)
     if m:
@@ -147,29 +188,38 @@ def classify_telegram_url(client, url):
                 try:
                     result = client(functions.messages.CheckChatInviteRequest(hash=invite_hash))
                 except Exception:
-                    return "unknown"
+                    return {"kind": "unknown", "members": None}
             else:
-                return "unknown"
+                return {"kind": "unknown", "members": None}
         except (InviteHashExpiredError,):
-            return "expired"
+            return {"kind": "expired", "members": None}
         except (InviteHashInvalidError,):
-            return "invalid"
+            return {"kind": "invalid", "members": None}
         except Exception as e:
             print(f"::warning::classify_telegram_url invite check failed for {url}: {type(e).__name__}: {e}")
-            return "unknown"
+            return {"kind": "unknown", "members": None}
 
         if isinstance(result, (types.ChatInviteAlready, types.ChatInvitePeek)):
             chat = result.chat
-            return "channel" if getattr(chat, "broadcast", False) else "group"
+            if getattr(chat, "broadcast", False):
+                return {"kind": "channel", "members": None}
+            jitter_sleep()
+            members = get_member_count(client, chat)
+            kind = "small_group" if (members is not None and members <= MIN_GROUP_MEMBERS) else "group"
+            return {"kind": kind, "members": members}
         if isinstance(result, types.ChatInvite):
-            return "channel" if getattr(result, "broadcast", False) else "group"
-        return "unknown"
+            if getattr(result, "broadcast", False):
+                return {"kind": "channel", "members": None}
+            members = get_member_count(client, result)  # free -- already in the response
+            kind = "small_group" if (members is not None and members <= MIN_GROUP_MEMBERS) else "group"
+            return {"kind": kind, "members": members}
+        return {"kind": "unknown", "members": None}
 
     m2 = TG_USERNAME_REGEX.search(url)
     if m2:
         username = m2.group(1)
         if username.lower() in TG_RESERVED_PATHS:
-            return "not_telegram"
+            return {"kind": "not_telegram", "members": None}
         try:
             entity = client.get_entity(username)
         except FloodWaitError as e:
@@ -178,24 +228,31 @@ def classify_telegram_url(client, url):
                 try:
                     entity = client.get_entity(username)
                 except Exception:
-                    return "unknown"
+                    return {"kind": "unknown", "members": None}
             else:
-                return "unknown"
+                return {"kind": "unknown", "members": None}
         except (UsernameNotOccupiedError, UsernameInvalidError, ValueError):
-            return "invalid"
+            return {"kind": "invalid", "members": None}
         except ChannelPrivateError:
-            return "invalid"
+            return {"kind": "invalid", "members": None}
         except Exception as e:
             print(f"::warning::classify_telegram_url username lookup failed for {url}: {type(e).__name__}: {e}")
-            return "unknown"
+            return {"kind": "unknown", "members": None}
 
         if isinstance(entity, types.Channel):
-            return "channel" if entity.broadcast else "group"
+            if entity.broadcast:
+                return {"kind": "channel", "members": None}
+            jitter_sleep()
+            members = get_member_count(client, entity)
+            kind = "small_group" if (members is not None and members <= MIN_GROUP_MEMBERS) else "group"
+            return {"kind": kind, "members": members}
         if isinstance(entity, types.Chat):
-            return "group"
-        return "invalid"  # resolved to a User or something else, not a group/channel
+            members = get_member_count(client, entity)  # free -- embedded on Chat
+            kind = "small_group" if (members is not None and members <= MIN_GROUP_MEMBERS) else "group"
+            return {"kind": kind, "members": members}
+        return {"kind": "invalid", "members": None}  # resolved to a User or something else
 
-    return "not_telegram"
+    return {"kind": "not_telegram", "members": None}
 
 
 def kv_get(key, default):
@@ -248,6 +305,24 @@ def _send_telegram_message(text: str, parse_mode: str | None = None) -> bool:
 def notify(text: str) -> bool:
     """Plain-text status ping to the bot chat."""
     return _send_telegram_message(text)
+
+
+# Unified status taxonomy for run-level notices (start / success / failed /
+# flood / error). Batch-delivery messages (📦) are a separate visual
+# language and don't go through this -- this is specifically for "how did
+# the run go" notices.
+_STATUS_EMOJI = {
+    "start": "🚀",
+    "success": "✅",
+    "failed": "❌",
+    "flood": "🌊",
+    "error": "⚠️",
+}
+
+
+def notify_status(status: str, text: str) -> bool:
+    emoji = _STATUS_EMOJI.get(status, "")
+    return notify(f"{emoji} {text}".strip())
 
 
 def _chunk_urls_by_length(urls, max_len=3500):
@@ -319,16 +394,16 @@ def run():
     # The same url can exist under multiple groups -- it's only a duplicate
     # if it was already recorded under *this* group.
     seen_by_group = {gid: set(urls) for gid, urls in state.get("seen_by_group", {}).items()}
-    # url_classifications: url -> 'group'/'channel'/'expired'/'invalid'/'unknown'.
+    # url_classifications: url -> {"kind": ..., "members": int|None}.
     # Cached across groups AND across runs, so the same url shared into 5
-    # different groups only ever costs 1 Telegram validation call, not 5.
+    # different groups only ever costs its API call(s) once, not 5 times.
     url_classifications = dict(state.get("url_classifications", {}))
 
     full_dataset = kv_get(KV_URLS_KEY, {"groups": {}})
     groups_data = full_dataset.get("groups", {})
 
     new_urls_this_run = []
-    rejected = {"channel": 0, "expired": 0, "invalid": 0}
+    rejected = {"channel": 0, "expired": 0, "invalid": 0, "small_group": 0}
     validation_calls = [0]  # mutable box, just for the final log line
 
     def persist():
@@ -348,13 +423,14 @@ def run():
         cached = url_classifications.get(u)
         if cached is not None:
             return cached  # no API call -- already known, from this run or a past one
-        kind = classify_telegram_url(client, u)
-        url_classifications[u] = kind
+        result = classify_telegram_url(client, u)
+        url_classifications[u] = result
         validation_calls[0] += 1
         jitter_sleep()  # only throttle actual new API calls
-        return kind
+        return result
 
     pending_batch = []
+    pending_batch_members = []  # parallel list, member counts for the header stat -- not sent in the copyable body
     batch_counter = [0]
 
     def flush_pending_batch():
@@ -362,8 +438,10 @@ def run():
         if not pending_batch:
             return
         batch_counter[0] += 1
+        known = [m for m in pending_batch_members if m is not None]
+        members_note = f", avg {sum(known)//len(known):,} members" if known else ""
         header = (
-            f"📦 Batch {batch_counter[0]} -- {len(pending_batch)} url(s) "
+            f"📦 Batch {batch_counter[0]} -- {len(pending_batch)} url(s){members_note} "
             f"(running total: {len(new_urls_this_run)}/{DAILY_LIMIT})"
         )
         ok = send_url_batch(pending_batch, header=header)
@@ -373,8 +451,9 @@ def run():
                 f"KV ထဲ ရေးထားပြီးသားပါ, Bot notify သာ fail တာပါ။"
             )
         pending_batch.clear()
+        pending_batch_members.clear()
 
-    notify(f"🚀 Extraction started. Target: {DAILY_LIMIT} new urls, max {MAX_NEW_URLS_PER_DIALOG}/group.")
+    notify_status("start", f"Extraction started. Target: {DAILY_LIMIT} new urls, max {MAX_NEW_URLS_PER_DIALOG}/group, >{MIN_GROUP_MEMBERS} members.")
 
     current_gid = [None]  # mutable box so the except block can see the in-progress group
 
@@ -406,8 +485,9 @@ def run():
                         if e.seconds > FLOOD_ABORT_SECONDS:
                             resume_at = datetime.now(timezone.utc) + timedelta(seconds=e.seconds)
                             flush_pending_batch()
-                            notify(
-                                f"⚠️ Flood wait -{e.seconds}s (~{e.seconds/3600:.1f}h) ကြုံရပါတယ်.\n"
+                            notify_status(
+                                "flood",
+                                f"Flood wait -{e.seconds}s (~{e.seconds/3600:.1f}h) ကြုံရပါတယ်.\n"
                                 f"{FLOOD_ABORT_SECONDS // 3600}h ကျော်လို့ workflow ကို ရပ်လိုက်ပါပြီ။🎯\n"
                                 f"Resume ဖြစ်မည့် အချိန်: {resume_at.strftime('%Y-%m-%d %H:%M UTC')}"
                             )
@@ -416,7 +496,7 @@ def run():
                             sys.exit(1)
                         else:
                             if e.seconds > 30:
-                                notify(f"⏳ FloodWait {e.seconds}s ကြုံရလို့ စောင့်နေပါတယ်...")
+                                notify_status("flood", f"FloodWait {e.seconds}s ကြုံရလို့ စောင့်နေပါတယ်...")
                             safe_sleep(e.seconds)
                             continue
 
@@ -432,11 +512,12 @@ def run():
                                 continue  # already recorded for THIS group
 
                             if VALIDATE_URLS:
-                                kind = classify_cached(client, u)
+                                result = classify_cached(client, u)
                             else:
-                                kind = "not_telegram"
+                                result = {"kind": "not_telegram", "members": None}
+                            kind, members = result["kind"], result["members"]
 
-                            if kind in ("channel", "expired", "invalid"):
+                            if kind in ("channel", "expired", "invalid", "small_group"):
                                 gid_seen.add(u)  # never re-check for this group again
                                 rejected[kind] += 1
                                 continue
@@ -446,10 +527,11 @@ def run():
                             new_urls_this_run.append(u)
                             new_from_this_dialog += 1
                             g = groups_data.setdefault(gid, {"group_name": dialog.name, "urls": [], "count": 0})
-                            g["urls"].append(u)
+                            g["urls"].append({"url": u, "members": members})
                             g["count"] = len(g["urls"])
 
                             pending_batch.append(u)
+                            pending_batch_members.append(members)
                             if len(pending_batch) >= BATCH_SIZE:
                                 flush_pending_batch()
                                 if len(new_urls_this_run) < DAILY_LIMIT:
@@ -486,8 +568,9 @@ def run():
             cursors[current_gid[0]] = cursors.get(current_gid[0], 0)
         flush_pending_batch()
         persist()
-        notify(
-            "🚫 Peer Flood ကြုံရပါတယ်.\n"
+        notify_status(
+            "flood",
+            "Peer Flood ကြုံရပါတယ်.\n"
             "Telegram က account ကို peer/history request များလွန်းလို့ temporarily flag တင်လိုက်ပါတယ်.\n"
             "ဒါက FloodWait လို တိတိကျကျ wait time မပါဘူး -- ရက်ချီနိုင်ပါတယ်.\n"
             "Workflow ကို ရပ်လိုက်ပါပြီ. ခဏနားပြီးမှ /extract ကို ပြန်စမ်းပါ (24h+ စောင့်ဖို့ recommend)."
@@ -501,10 +584,12 @@ def run():
     if any(rejected.values()):
         filtered_note = (
             f"\n🧹 Filtered out -- channel: {rejected.get('channel', 0)}, "
+            f"small_group (≤{MIN_GROUP_MEMBERS}): {rejected.get('small_group', 0)}, "
             f"expired: {rejected.get('expired', 0)}, invalid: {rejected.get('invalid', 0)}"
         )
-    notify(
-        f"✅ Run complete -- {len(new_urls_this_run)} new url(s) sent across "
+    notify_status(
+        "success",
+        f"Run complete -- {len(new_urls_this_run)} new url(s) sent across "
         f"{batch_counter[0]} batch(es). Total (group,url) records: {total_records}."
         f"{filtered_note}"
     )
@@ -525,5 +610,5 @@ if __name__ == "__main__":
         # if the bot notify below also fails, so a fully silent failure
         # (no bot message AND nothing visible) is no longer possible.
         print(f"::error::Action ရပ်သွားခဲ့သည်, ဘာဖြစ်လို့ error: {err_msg}")
-        notify(f"❌ Error ကြောင့် workflow ရပ်သွားပါတယ်:\n{err_msg}")
+        notify_status("failed", f"Error ကြောင့် workflow ရပ်သွားပါတယ်:\n{err_msg}")
         raise

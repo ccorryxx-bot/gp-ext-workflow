@@ -94,9 +94,37 @@ back to raw regex extraction):
   `CheckChatInviteRequest`. Expired/revoked → dropped as `expired`, unresolvable → `invalid`.
 - `t.me/username` (public links) → `get_entity`. Not found → `invalid`.
 - Either way, if it resolves to a broadcast channel (not a group/megagroup) → dropped as `channel`.
+- If it's a real group/megagroup, its member count is checked against
+  `MIN_GROUP_MEMBERS` (default 1500) -- `<=` that many members → dropped as
+  `small_group`. A count that couldn't be determined (transient API failure)
+  is treated as passing, not dropped -- see the docstring on
+  `classify_telegram_url` for the reasoning.
 - Non-Telegram URLs pass through unvalidated (kept as-is).
 
-This costs one extra Telegram API call per *new, not-yet-cached* URL.
+Member counts come free for not-yet-joined private invite links (embedded
+in the `CheckChatInviteRequest` response); everything else needs one more
+API call (`GetFullChannelRequest`) on top of the group/channel check. Both
+calls (and their results) are cached per url in `url_classifications`, so
+repeats -- within a run or across days -- cost nothing extra.
+
+The `urls` KV dataset stores each entry as `{"url": ..., "members": N}`
+(not a bare string) so member counts are queryable later --
+`GET /urls?account=vsn&min_members=5000` filters by it.
+
+## Bot notifications
+
+Run-level status notices (not the per-batch url pushes) go through a small
+taxonomy in `notify_status(status, text)`:
+
+| status    | emoji | when |
+|-----------|-------|------|
+| `start`   | 🚀    | run begins |
+| `success` | ✅    | run finished normally (with a filtered-out breakdown if anything was dropped) |
+| `flood`   | 🌊    | FloodWait abort, a long FloodWait sleep, or PeerFlood |
+| `failed`  | ❌    | any unhandled exception |
+| `error`   | ⚠️    | reserved for future use (mid-run degraded-but-continuing conditions) |
+
+Batch url deliveries keep their own 📦 prefix -- they're data, not a status.
 
 ## Multiple Telegram accounts (VSN / NCH)
 
