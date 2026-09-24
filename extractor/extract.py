@@ -130,14 +130,33 @@ def extract_urls_from_text(text):
 
 
 MYANMAR_SCRIPT_RE = re.compile(r'[\u1000-\u109F\uAA60-\uAA7F\uA9E0-\uA9FF]')
+# English-script fallback: many genuine Myanmar groups (especially trading/
+# business ones aiming for wider reach) name and describe themselves
+# entirely in Latin script -- "Myanmar Trading Group" has ZERO Myanmar
+# Unicode characters despite being a Myanmar group. Script-only detection
+# would wrongly drop these as 'not_myanmar'. This catches that case.
+# Deliberately excludes bare "MM"/"MMK" -- too short, too likely to
+# false-positive on unrelated titles; the tradeoff here is intentionally
+# biased toward keeping (a few extra non-Myanmar groups let through) over
+# dropping a real one, per explicit instruction -- tune this list if that
+# balance needs to shift.
+MYANMAR_KEYWORD_RE = re.compile(
+    r'\b(myanmar|burma|burmese|yangon|mandalay|naypyidaw|naypyitaw)\b', re.IGNORECASE
+)
 
 
 def looks_myanmar(text):
-    """True/False if text has/lacks Myanmar-script characters, None if
-    there's no text to judge from at all (title+about both empty)."""
+    """True if text has Myanmar-script characters OR an English Myanmar-
+    indicator keyword (see MYANMAR_KEYWORD_RE) -- False only when NEITHER
+    signal is present. None if there's no text to judge from at all
+    (title+about both empty)."""
     if not text or not text.strip():
         return None
-    return bool(MYANMAR_SCRIPT_RE.search(text))
+    if MYANMAR_SCRIPT_RE.search(text):
+        return True
+    if MYANMAR_KEYWORD_RE.search(text):
+        return True
+    return False
 
 
 def get_group_details(client, obj):
@@ -247,14 +266,16 @@ def classify_telegram_url(client, url):
                 return {"kind": "channel", "members": None}
             jitter_sleep()
             members, about = get_group_details(client, chat)
-            kind = _decide_kind(members, about, getattr(chat, "title", None))
-            return {"kind": kind, "members": members}
+            title = getattr(chat, "title", None)
+            kind = _decide_kind(members, about, title)
+            return {"kind": kind, "members": members, "title": title, "about": about}
         if isinstance(result, types.ChatInvite):
             if getattr(result, "broadcast", False):
                 return {"kind": "channel", "members": None}
             members, about = get_group_details(client, result)  # free -- already in the response
-            kind = _decide_kind(members, about, getattr(result, "title", None))
-            return {"kind": kind, "members": members}
+            title = getattr(result, "title", None)
+            kind = _decide_kind(members, about, title)
+            return {"kind": kind, "members": members, "title": title, "about": about}
         return {"kind": "unknown", "members": None}
 
     m2 = TG_USERNAME_REGEX.search(url)
@@ -286,12 +307,14 @@ def classify_telegram_url(client, url):
                 return {"kind": "channel", "members": None}
             jitter_sleep()
             members, about = get_group_details(client, entity)
-            kind = _decide_kind(members, about, getattr(entity, "title", None))
-            return {"kind": kind, "members": members}
+            title = getattr(entity, "title", None)
+            kind = _decide_kind(members, about, title)
+            return {"kind": kind, "members": members, "title": title, "about": about}
         if isinstance(entity, types.Chat):
             members, about = get_group_details(client, entity)  # free -- embedded on Chat
-            kind = _decide_kind(members, about, getattr(entity, "title", None))
-            return {"kind": kind, "members": members}
+            title = getattr(entity, "title", None)
+            kind = _decide_kind(members, about, title)
+            return {"kind": kind, "members": members, "title": title, "about": about}
         return {"kind": "invalid", "members": None}  # resolved to a User or something else
 
     return {"kind": "not_telegram", "members": None}
@@ -575,6 +598,10 @@ def run():
                             else:
                                 result = {"kind": "not_telegram", "members": None}
                             kind, members = result["kind"], result["members"]
+                            title = result.get("title")
+                            about = result.get("about")
+                            if about:
+                                about = about.strip()[:200]  # keep the KV dataset lean
 
                             if kind in ("channel", "expired", "invalid", "small_group", "not_myanmar"):
                                 gid_seen.add(u)  # never re-check for this group again
@@ -586,7 +613,12 @@ def run():
                             new_urls_this_run.append(u)
                             new_from_this_dialog += 1
                             g = groups_data.setdefault(gid, {"group_name": dialog.name, "urls": [], "count": 0})
-                            g["urls"].append({"url": u, "members": members})
+                            entry = {"url": u, "members": members}
+                            if title:
+                                entry["title"] = title
+                            if about:
+                                entry["about"] = about
+                            g["urls"].append(entry)
                             g["count"] = len(g["urls"])
 
                             pending_batch.append(u)

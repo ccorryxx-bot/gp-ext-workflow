@@ -99,14 +99,23 @@ back to raw regex extraction):
   `small_group`. A count that couldn't be determined (transient API failure)
   is treated as passing, not dropped -- see the docstring on
   `classify_telegram_url` for the reasoning.
-- If `MYANMAR_ONLY=1` (default), its title+about are checked for Myanmar
-  script (Unicode U+1000-U+109F etc). No Myanmar characters found → dropped
-  as `not_myanmar`. No title/about text to judge from → treated as passing,
-  not dropped, same reasoning as the member-count case. Set `MYANMAR_ONLY=0`
-  to turn this off (member-count filtering still applies). This is a script
-  check, not language detection -- Myanmar's script is its own Unicode
-  block with zero overlap with Latin/Cyrillic, so a simple character-range
-  check is both faster and more reliable here than a language-ID library.
+- If `MYANMAR_ONLY=1` (default), its title+about are checked for either
+  Myanmar script (Unicode U+1000-U+109F etc, catches Zawgyi too -- it
+  reuses codepoints in the same block) OR an English Myanmar-indicator
+  keyword (myanmar/burma/burmese/yangon/mandalay/naypyidaw, see
+  `MYANMAR_KEYWORD_RE`) -- neither found → dropped as `not_myanmar`. The
+  keyword fallback exists because plenty of genuine Myanmar groups (trading/
+  business ones especially) name and describe themselves entirely in Latin
+  script -- "Myanmar Trading Group" has zero Myanmar Unicode characters
+  despite being a Myanmar group; script-only detection would wrongly drop
+  it. No title/about text to judge from → treated as passing, not dropped,
+  same reasoning as the member-count case. Set `MYANMAR_ONLY=0` to turn
+  this off (member-count filtering still applies). This is still script/
+  keyword matching, not statistical language detection -- Myanmar's script
+  has zero overlap with Latin/Cyrillic, so a character-range + keyword
+  check is both faster and more reliable here than a language-ID library,
+  and it's deliberately biased toward keeping a url when uncertain rather
+  than dropping a real Myanmar group.
 - Non-Telegram URLs pass through unvalidated (kept as-is).
 
 Member counts and the about text both come free for not-yet-joined private
@@ -116,6 +125,12 @@ member-count and language checks together -- not two separate calls. All
 of this (including the Myanmar-script result) is cached per url in
 `url_classifications`, so repeats -- within a run, across groups, across
 days -- cost nothing extra.
+
+Kept urls also carry `title` and (up to 200 chars of) `about` when known --
+both come from data already fetched for the member-count/language checks,
+so this adds no extra API calls. Omitted from the entry entirely when
+unknown (e.g. `not_telegram`/`unknown` kind, or the rare Chat-without-about
+case) rather than stored as null.
 
 The `urls` KV dataset stores each entry as `{"url": ..., "members": N}`
 (not a bare string) so member counts are queryable later --
