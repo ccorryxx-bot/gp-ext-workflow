@@ -35,6 +35,7 @@ jobs:
           MAX_NEW_URLS_PER_DIALOG: "5"  # round-robin cap: one busy group can't eat the whole DAILY_LIMIT
           MIN_GROUP_MEMBERS: "1500"
           MYANMAR_ONLY: "1"
+          MAX_RUN_MINUTES: "300"  # stays under the job timeout-minutes: 330, leaving buffer for a clean notify
           BATCH_SIZE: "10"
           BATCH_REST_MIN_MINUTES: "15"
           BATCH_REST_MAX_MINUTES: "30"

@@ -48,18 +48,34 @@ instead of scanning everything first and dumping all 50 at the end. This
 breaks up the request burst pattern; Telegram's flood detection cares more
 about volume-in-a-short-window than sub-second timing. Per-message and
 per-validation-call pacing is also randomized (`DELAY_MIN_SECONDS`–
-`DELAY_MAX_SECONDS`, default 1–4s) instead of a fixed delay.
+`DELAY_MAX_SECONDS`, default 1–4s) instead of a fixed delay -- and only
+applied once per message: if a message's url(s) already triggered a fresh
+(non-cached) classification call, that call's own jitter already paced
+this message, so the generic per-message jitter is skipped rather than
+stacking a redundant sleep on top.
 
-A full `DAILY_LIMIT=50` run therefore normally takes roughly 1.5–2h
-(mostly the batch rests), well inside the job's `timeout-minutes: 330`
-safety cap (GitHub's hard limit is 360min/6h). Note: in a pathological case
--- many groups with zero matching urls, each scanned to its full
-`MAX_SCAN_PER_DIALOG` -- the scanning phase itself could still run long;
-the job timeout exists as a backstop for that.
+A full `DAILY_LIMIT=50` run normally takes roughly 1.5–2h (mostly the
+batch rests). The pathological case is real, though, and hit in practice:
+many groups the account is in can have zero matching urls (all filtered
+out, or genuinely none posted), each still scanned to its full
+`MAX_SCAN_PER_DIALOG` -- across enough such groups, a run can genuinely
+take hours without ever reaching DAILY_LIMIT.
 
-If a run is interrupted (FloodWait abort, PeerFlood, or the job timeout),
+That matters because `timeout-minutes: 330` (job's hard cap, under
+GitHub's 360min/6h ceiling) is an **OS-level kill** when it fires --
+nothing in the script's own try/except can catch it, so no bot notice can
+go out. `MAX_RUN_MINUTES` (default 300) exists specifically to prevent
+that: the run checks its own elapsed time between dialogs (and inside a
+dialog's scan loop) and, if exceeded, stops itself early -- flushing the
+pending batch, persisting cursors, and sending a `timeout` (⏰) notice --
+comfortably before the hard kill would otherwise take that chance away.
+`MAX_RUN_MINUTES` should always stay meaningfully below `timeout-minutes`
+(30min of buffer by default) so the cleanup itself has time to finish.
+
+If a run is interrupted (FloodWait abort, PeerFlood, or the time budget),
 whatever's already been found and validated is flushed to the bot and
-persisted to KV before it exits.
+persisted to KV before it exits, and cursors resume next run from exactly
+where it stopped.
 
 Each batch (and the final summary) is sent as a native-monospace,
 tap-to-copy bracketed list: `[https://t.me/a,https://t.me/b,...]`.
@@ -145,6 +161,7 @@ taxonomy in `notify_status(status, text)`:
 |-----------|-------|------|
 | `start`   | 🚀    | run begins |
 | `success` | ✅    | run finished normally (with a filtered-out breakdown if anything was dropped) |
+| `timeout` | ⏰    | self-stopped after `MAX_RUN_MINUTES` to leave time for a clean notice before the job's hard kill (see "Delivery pacing") |
 | `flood`   | 🌊    | FloodWait abort, a long FloodWait sleep, or PeerFlood |
 | `failed`  | ❌    | any unhandled exception |
 | `error`   | ⚠️    | reserved for future use (mid-run degraded-but-continuing conditions) |

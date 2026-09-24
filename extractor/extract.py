@@ -64,6 +64,13 @@ BOT_CHAT_ID = os.environ["BOT_CHAT_ID"]
 # new urls found" is distinguishable from "the job never actually ran".
 RUN_START_TIME = datetime.now(timezone.utc)
 
+# The GH Actions job itself is killed at timeout-minutes: 330 (an OS-level
+# process kill our own try/except can never catch, so no bot notice can go
+# out when THAT happens -- see the incident this constant exists to
+# prevent). Stopping ourselves comfortably before that always leaves time
+# for a clean flush + persist + notify.
+MAX_RUN_SECONDS = int(os.environ.get("MAX_RUN_MINUTES", "300")) * 60
+
 CF_ACCOUNT_ID = os.environ["CF_ACCOUNT_ID"]
 CF_API_TOKEN = os.environ["CF_API_TOKEN"]
 CF_KV_NAMESPACE_ID = os.environ["CF_KV_NAMESPACE_ID"]
@@ -382,6 +389,7 @@ _STATUS_EMOJI = {
     "failed": "❌",
     "flood": "🌊",
     "error": "⚠️",
+    "timeout": "⏰",
 }
 
 
@@ -466,6 +474,8 @@ def batch_rest_sleep():
     time.sleep(seconds)
 
 
+def time_budget_exceeded():
+    return (datetime.now(timezone.utc) - RUN_START_TIME).total_seconds() > MAX_RUN_SECONDS
 
 
 def run():
@@ -537,11 +547,15 @@ def run():
     notify_status("start", f"Extraction started. Target: {DAILY_LIMIT} new urls, max {MAX_NEW_URLS_PER_DIALOG}/group, >{MIN_GROUP_MEMBERS} members.")
 
     current_gid = [None]  # mutable box so the except block can see the in-progress group
+    stopped_for_time_budget = False
 
     try:
         with TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH) as client:
             for dialog in client.iter_dialogs():
                 if len(new_urls_this_run) >= DAILY_LIMIT:
+                    break
+                if time_budget_exceeded():
+                    stopped_for_time_budget = True
                     break
                 if not (dialog.is_group or dialog.is_channel):
                     continue
@@ -557,6 +571,7 @@ def run():
                     len(new_urls_this_run) < DAILY_LIMIT
                     and new_from_this_dialog < MAX_NEW_URLS_PER_DIALOG
                     and scanned < MAX_SCAN_PER_DIALOG
+                    and not time_budget_exceeded()
                 ):
                     try:
                         messages = list(
@@ -588,12 +603,15 @@ def run():
                     for message in messages:
                         scanned += 1
                         last_seen_id = max(last_seen_id, message.id)
+                        did_fresh_classify = False  # true if any url below triggered a real API call
 
                         for u in extract_urls_from_text(message.raw_text):
                             if u in gid_seen:
                                 continue  # already recorded for THIS group
 
                             if VALIDATE_URLS:
+                                if u not in url_classifications:
+                                    did_fresh_classify = True  # classify_cached is about to jitter for this one itself
                                 result = classify_cached(client, u)
                             else:
                                 result = {"kind": "not_telegram", "members": None}
@@ -634,7 +652,12 @@ def run():
                             ):
                                 break
 
-                        jitter_sleep()
+                        if not did_fresh_classify:
+                            # No API call happened for this message (no urls, or all
+                            # cached) -- still pace the plain message-scanning cadence.
+                            # If a fresh classify DID happen, classify_cached already
+                            # jittered for it -- an extra sleep here would just stack.
+                            jitter_sleep()
                         if (
                             len(new_urls_this_run) >= DAILY_LIMIT
                             or new_from_this_dialog >= MAX_NEW_URLS_PER_DIALOG
@@ -645,10 +668,15 @@ def run():
                         scanned >= MAX_SCAN_PER_DIALOG
                         or len(new_urls_this_run) >= DAILY_LIMIT
                         or new_from_this_dialog >= MAX_NEW_URLS_PER_DIALOG
+                        or time_budget_exceeded()
                     ):
                         break
 
                 cursors[gid] = last_seen_id
+
+                if time_budget_exceeded():
+                    stopped_for_time_budget = True
+                    break
 
     except PeerFloodError:
         # No wait-time given by Telegram for this one -- the account itself has
@@ -680,13 +708,24 @@ def run():
             f"not_myanmar: {rejected.get('not_myanmar', 0)}, "
             f"expired: {rejected.get('expired', 0)}, invalid: {rejected.get('invalid', 0)}"
         )
-    notify_status(
-        "success",
-        f"Run complete -- {len(new_urls_this_run)} new url(s) sent across "
-        f"{batch_counter[0]} batch(es). Total (group,url) records: {total_records}."
-        f"{filtered_note}\n"
-        f"⏱ Run duration: {format_elapsed()}"
-    )
+    if stopped_for_time_budget:
+        notify_status(
+            "timeout",
+            f"Time budget ({MAX_RUN_SECONDS // 60}min) ရောက်လို့ run ကို ကိုယ်တိုင် ရပ်လိုက်ပါပြီ "
+            f"(GitHub ရဲ့ job timeout မမီခင်, clean notify ပို့ခွင့်ရအောင်).\n"
+            f"{len(new_urls_this_run)} new url(s) sent across {batch_counter[0]} batch(es). "
+            f"Total (group,url) records: {total_records}.{filtered_note}\n"
+            f"Cursor state save ပြီးသားမို့ နောက် run ကျရင် ရပ်ခဲ့တဲ့နေရာကနေ ဆက်မယ်.\n"
+            f"⏱ Run duration: {format_elapsed()}"
+        )
+    else:
+        notify_status(
+            "success",
+            f"Run complete -- {len(new_urls_this_run)} new url(s) sent across "
+            f"{batch_counter[0]} batch(es). Total (group,url) records: {total_records}."
+            f"{filtered_note}\n"
+            f"⏱ Run duration: {format_elapsed()}"
+        )
     print(
         f"DONE: {len(new_urls_this_run)} new urls this run. Total (group,url) records: {total_records}. "
         f"Rejected: {rejected}. Telegram validation API calls this run: {validation_calls[0]}. "
