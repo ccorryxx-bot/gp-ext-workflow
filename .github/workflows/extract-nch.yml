@@ -1,9 +1,7 @@
 name: nch_ext_workflow
 
 on:
-  schedule:
-    - cron: "30 3 * * *"   # once a day, 03:30 UTC -- staggered 30min after vsn_ext_workflow
-  workflow_dispatch: {}
+  workflow_dispatch: {}   # admin-triggered only (Bot /extract) -- no cron schedule
 
 jobs:
   extract:

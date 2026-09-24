@@ -1,12 +1,12 @@
 # gp-ext-workflow
 
-Extracts URLs from your own Telegram groups/channels on a schedule, stores them in
-Cloudflare KV, and serves them via a Cloudflare Worker HTTP endpoint.
+Extracts URLs from your own Telegram groups/channels, admin-triggered on demand,
+stores them in Cloudflare KV, and serves them via a Cloudflare Worker HTTP endpoint.
 
 ## Architecture
 
 ```
-GitHub Actions (cron, once daily)
+GitHub Actions (workflow_dispatch, admin-triggered via Bot /extract -- no cron)
     -> extractor/extract.py  (Telethon, logs in with STRING_SESSION)
        - reads "state" (cursors + seen_by_group + url_classifications) from
          Cloudflare KV via REST API
@@ -157,7 +157,7 @@ same bot chat and the same Cloudflare KV namespace:
 
 To add a third account: add its 3 `<KEY>_*` secrets, add a
 `.github/workflows/extract-<key>.yml` (copy an existing one, change
-`ACCOUNT`/secret names/cron), and add it to the `ACCOUNTS` map at the top
+`ACCOUNT`/secret names), and add it to the `ACCOUNTS` map at the top
 of `worker/src/index.js`.
 
 ## One-time setup
@@ -185,5 +185,6 @@ See the setup table shared separately.
 
 ## Manual run
 
-Both workflows support `workflow_dispatch`, so you can trigger them by hand from
-the Actions tab instead of waiting for the cron schedule.
+Both workflows only run via `workflow_dispatch` -- no cron. Trigger them
+with `/extract` in the bot (asks VSN / NCH / Both), or by hand from the
+Actions tab.

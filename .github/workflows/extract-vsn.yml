@@ -1,9 +1,7 @@
 name: vsn_ext_workflow
 
 on:
-  schedule:
-    - cron: "0 3 * * *"   # once a day, 03:00 UTC
-  workflow_dispatch: {}
+  workflow_dispatch: {}   # admin-triggered only (Bot /extract) -- no cron schedule
 
 jobs:
   extract:
