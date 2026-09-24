@@ -59,6 +59,11 @@ STRING_SESSION = os.environ["STRING_SESSION"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 BOT_CHAT_ID = os.environ["BOT_CHAT_ID"]
 
+# Captured at module load, i.e. essentially script start -- used to report
+# how long the run has been going in every terminal/abort notice, so "0
+# new urls found" is distinguishable from "the job never actually ran".
+RUN_START_TIME = datetime.now(timezone.utc)
+
 CF_ACCOUNT_ID = os.environ["CF_ACCOUNT_ID"]
 CF_API_TOKEN = os.environ["CF_API_TOKEN"]
 CF_KV_NAMESPACE_ID = os.environ["CF_KV_NAMESPACE_ID"]
@@ -362,6 +367,22 @@ def notify_status(status: str, text: str) -> bool:
     return notify(f"{emoji} {text}".strip())
 
 
+def format_elapsed(start_time=None):
+    """Human-readable elapsed time since start_time (defaults to
+    RUN_START_TIME, i.e. script start). Used in every terminal/abort notice
+    so 'the run found nothing' and 'the run never really ran' are never
+    confused with each other."""
+    delta = datetime.now(timezone.utc) - (start_time or RUN_START_TIME)
+    total_seconds = int(delta.total_seconds())
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes}m {seconds}s"
+    if minutes:
+        return f"{minutes}m {seconds}s"
+    return f"{seconds}s"
+
+
 def _chunk_urls_by_length(urls, max_len=3500):
     """Group urls into chunks whose bracketed-list rendering stays under
     Telegram's 4096-char message cap (max_len leaves headroom for the
@@ -526,7 +547,8 @@ def run():
                                 "flood",
                                 f"Flood wait -{e.seconds}s (~{e.seconds/3600:.1f}h) ကြုံရပါတယ်.\n"
                                 f"{FLOOD_ABORT_SECONDS // 3600}h ကျော်လို့ workflow ကို ရပ်လိုက်ပါပြီ။🎯\n"
-                                f"Resume ဖြစ်မည့် အချိန်: {resume_at.strftime('%Y-%m-%d %H:%M UTC')}"
+                                f"Resume ဖြစ်မည့် အချိန်: {resume_at.strftime('%Y-%m-%d %H:%M UTC')}\n"
+                                f"⏱ Run duration: {format_elapsed()}"
                             )
                             cursors[gid] = last_seen_id
                             persist()
@@ -610,7 +632,8 @@ def run():
             "Peer Flood ကြုံရပါတယ်.\n"
             "Telegram က account ကို peer/history request များလွန်းလို့ temporarily flag တင်လိုက်ပါတယ်.\n"
             "ဒါက FloodWait လို တိတိကျကျ wait time မပါဘူး -- ရက်ချီနိုင်ပါတယ်.\n"
-            "Workflow ကို ရပ်လိုက်ပါပြီ. ခဏနားပြီးမှ /extract ကို ပြန်စမ်းပါ (24h+ စောင့်ဖို့ recommend)."
+            "Workflow ကို ရပ်လိုက်ပါပြီ. ခဏနားပြီးမှ /extract ကို ပြန်စမ်းပါ (24h+ စောင့်ဖို့ recommend).\n"
+            f"⏱ Run duration: {format_elapsed()}"
         )
         sys.exit(1)
 
@@ -629,11 +652,13 @@ def run():
         "success",
         f"Run complete -- {len(new_urls_this_run)} new url(s) sent across "
         f"{batch_counter[0]} batch(es). Total (group,url) records: {total_records}."
-        f"{filtered_note}"
+        f"{filtered_note}\n"
+        f"⏱ Run duration: {format_elapsed()}"
     )
     print(
         f"DONE: {len(new_urls_this_run)} new urls this run. Total (group,url) records: {total_records}. "
-        f"Rejected: {rejected}. Telegram validation API calls this run: {validation_calls[0]}."
+        f"Rejected: {rejected}. Telegram validation API calls this run: {validation_calls[0]}. "
+        f"Elapsed: {format_elapsed()}."
     )
 
 
@@ -648,5 +673,5 @@ if __name__ == "__main__":
         # if the bot notify below also fails, so a fully silent failure
         # (no bot message AND nothing visible) is no longer possible.
         print(f"::error::Action ရပ်သွားခဲ့သည်, ဘာဖြစ်လို့ error: {err_msg}")
-        notify_status("failed", f"Error ကြောင့် workflow ရပ်သွားပါတယ်:\n{err_msg}")
+        notify_status("failed", f"Error ကြောင့် workflow ရပ်သွားပါတယ်:\n{err_msg}\n⏱ Run duration: {format_elapsed()}")
         raise
