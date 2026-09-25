@@ -164,15 +164,33 @@ just groups that produce a batch):
    Telethon already loaded for the dialog list -- free, no extra API call;
    often `null` for channels, which need a separate call this doesn't pay
    for just to report a number), `messages_scanned_this_group` and
-   `total_messages_scanned` (this run), `total_urls_found_this_run`, and
-   `estimated_next_group_at` (projected from this run's actual observed
-   pace so far -- elapsed time ÷ messages scanned, so jitter sleeps and
-   batch rests are already baked into the rate, not just raw scan speed;
-   an estimate, not a promise). Reading it costs exactly one KV GET, no
-   Telegram or GitHub Actions API calls -- the bot's `/status [vsn|nch]`
-   command includes it automatically when a snapshot exists, and it's also
-   exposed directly over HTTP as `GET /status?account=vsn|nch` on the
-   Worker (same auth as `/urls`), for polling from anywhere else.
+   `total_messages_scanned` (this run), `current_group_raw_url_count`,
+   `total_urls_found_this_run`, and `estimated_next_group_at` (projected
+   from this run's actual observed pace so far -- elapsed time ÷ messages
+   scanned, so jitter sleeps and batch rests are already baked into the
+   rate, not just raw scan speed; an estimate, not a promise). Reading it
+   costs exactly one KV GET, no Telegram or GitHub Actions API calls -- the
+   bot's `/status [vsn|nch]` command includes it automatically when a
+   snapshot exists, and it's also exposed directly over HTTP as
+   `GET /status?account=vsn|nch` on the Worker (same auth as `/urls`), for
+   polling from anywhere else.
+
+   Two url counts are tracked, deliberately kept separate because they
+   answer different questions and conflating them is exactly what caused
+   confusion once already (see git history): `current_group_raw_url_count`
+   is how many messages in the group *currently being scanned* contain a
+   url, still unscanned as of this run's cursor (`min_id`) -- one cheap
+   `messages.search(filter=InputMessagesFilterUrl, limit=0)` call per group
+   ENTERED (`count_raw_url_messages`, one extra API call, not per message;
+   Telegram returns just the `.total` count, no message bodies fetched).
+   It's a raw density signal, pre-validation -- a message with 2 links only
+   counts once, and it says nothing about whether those links pass the
+   member-count filter. `total_urls_found_this_run` is the opposite: fully
+   validated, deduped, kept urls, summed across every group scanned SO FAR
+   this run (matches the running total in batch headers). The live bot
+   message shows the raw per-group count under "Total urls found" (per an
+   explicit request that it reflect "what's in this group", not a
+   cross-group cumulative); `/status` shows both, labeled separately.
 
 2. **Bot chat** -- the same fields, formatted, are pushed live into the
    🚀 start notice itself via `editMessageText`, so progress is visible

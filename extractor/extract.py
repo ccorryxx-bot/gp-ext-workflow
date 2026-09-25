@@ -151,11 +151,9 @@ def get_group_details(client, obj):
     """obj is either a types.ChatInvite (not-yet-joined invite -- title,
     about, and participants_count are all already embedded in it, free) or
     a resolved Chat/Channel entity. Chat has participants_count embedded
-    but not `about` (would need a further GetFullChatRequest -- skipped,
-    rare case, falls back to title-only language detection). Channel needs
-    one GetFullChannelRequest for BOTH participants_count and about
-    together -- one extra call covers both the member-count and the
-    language filters, not two.
+    but not `about`. Channel needs one GetFullChannelRequest for
+    participants_count (about comes along for free in the same response,
+    even though nothing currently uses it for filtering).
 
     Returns (members, about) -- either can be None if undeterminable."""
     if isinstance(obj, types.ChatInvite):
@@ -178,6 +176,33 @@ def get_group_details(client, obj):
         except Exception:
             return None, None
     return None, None
+
+
+def count_raw_url_messages(client, dialog, min_id):
+    """Single search-API call (messages.search with InputMessagesFilterUrl,
+    limit=0) -- Telegram returns just a `.total` count without actually
+    fetching any message bodies, so this is cheap: exactly one extra call
+    per group ENTERED (not per message). Scoped with min_id=<this group's
+    cursor> so the number reflects 'still unscanned by this run', not the
+    group's entire history -- that's what actually matters when deciding
+    mid-run whether a group is worth continuing to scan.
+
+    NOTE: this counts MESSAGES containing at least one url, not urls
+    themselves -- a message with 2 links only adds 1 here, so treat it as
+    a density indicator, not an exact url count. None if the lookup failed
+    (non-fatal -- this is a status nicety, not core to extraction)."""
+    try:
+        return client.get_messages(dialog, limit=0, filter=types.InputMessagesFilterUrl, min_id=min_id).total
+    except FloodWaitError as e:
+        if e.seconds <= 60:
+            safe_sleep(e.seconds)
+            try:
+                return client.get_messages(dialog, limit=0, filter=types.InputMessagesFilterUrl, min_id=min_id).total
+            except Exception:
+                return None
+        return None
+    except Exception:
+        return None
 
 
 def _decide_kind(members):
@@ -586,6 +611,7 @@ def run():
     # speed, so the pace is real rather than theoretical.
     live = {
         "current_group": None, "current_group_id": None, "current_group_members": None,
+        "current_group_raw_url_count": None,
         "dialog_number": 0, "dialog_start_time": None,
         "messages_scanned_this_group": 0,
     }
@@ -630,8 +656,20 @@ def run():
             members_txt = f"{members:,} members" if members is not None else "members unknown"
             lines.append(f"Group #{live['dialog_number']}: {live['current_group']} ({members_txt})")
             lines.append(f"Scanned in this group: {live['messages_scanned_this_group']}")
+            # Raw url-BEARING message count still unscanned in THIS group
+            # (min_id=cursor) -- one search-API call per group entered, see
+            # count_raw_url_messages. Deliberately NOT the validated/kept
+            # count from new_urls_this_run: that number is cumulative
+            # across the whole run and only grows after a message is
+            # actually classified, so early on it reads as a misleading
+            # "0" even in a link-dense group -- see the conversation that
+            # led to this. A message with multiple links only counts once.
+            raw_count = live["current_group_raw_url_count"]
+            if raw_count is not None:
+                lines.append(f"Total urls found: {raw_count:,}")
+            else:
+                lines.append("Total urls found: unknown (lookup failed)")
         lines.append(f"Total messages scanned: {total_scanned_box[0]}")
-        lines.append(f"Total urls found: {len(new_urls_this_run)}")
         if eta:
             lines.append(f"Est. next group swap: ~{eta.strftime('%H:%M UTC')} (pace estimate, not exact)")
         lines.append(f"⏱ Run duration: {format_elapsed()}")
@@ -676,6 +714,7 @@ def run():
             current_group=live["current_group"],
             current_group_id=live["current_group_id"],
             current_group_members=live["current_group_members"],
+            current_group_raw_url_count=live["current_group_raw_url_count"],
             dialog_number=live["dialog_number"],
             messages_scanned_this_group=live["messages_scanned_this_group"],
             total_messages_scanned=total_scanned_box[0],
@@ -719,6 +758,13 @@ def run():
                 # Channel usually needs GetFullChannelRequest to know this, which we
                 # don't pay for here just to report a status number.
                 live["current_group_members"] = getattr(dialog.entity, "participants_count", None)
+                # One extra API call per group entered (not per message) --
+                # see count_raw_url_messages docstring. Scoped to min_id=
+                # last_seen_id, i.e. "still unscanned by this run", since
+                # that's the number that actually informs a mid-run skip
+                # decision -- a group fully caught up from past runs would
+                # otherwise always show its whole (irrelevant) history size.
+                live["current_group_raw_url_count"] = count_raw_url_messages(client, dialog, last_seen_id)
                 live["dialog_number"] += 1
                 live["dialog_start_time"] = datetime.now(timezone.utc)
                 live["messages_scanned_this_group"] = 0

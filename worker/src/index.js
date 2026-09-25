@@ -303,9 +303,15 @@ function formatLiveStatus(live) {
       live.current_group_members != null ? `${live.current_group_members.toLocaleString()} members` : "members unknown";
     lines.push(`Group #${live.dialog_number ?? "?"}: ${live.current_group} (${members})`);
     lines.push(`Scanned in this group: ${live.messages_scanned_this_group ?? 0}`);
+    // Raw url-bearing message count still unscanned in THIS group (not the
+    // validated/kept count below, which is cumulative for the whole run) --
+    // see extract.py's count_raw_url_messages for why these are kept separate.
+    lines.push(
+      `Total urls found: ${live.current_group_raw_url_count != null ? live.current_group_raw_url_count.toLocaleString() : "unknown"}`
+    );
   }
   lines.push(`Total messages scanned this run: ${live.total_messages_scanned ?? 0}`);
-  lines.push(`Total urls found this run: ${live.total_urls_found_this_run ?? 0}`);
+  lines.push(`Total urls kept so far this run (validated): ${live.total_urls_found_this_run ?? 0}`);
   if (live.estimated_next_group_at) {
     lines.push(`Est. next group swap: ~${new Date(live.estimated_next_group_at).toUTCString()} (rough estimate, not exact)`);
   }
