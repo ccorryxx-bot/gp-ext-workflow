@@ -20,8 +20,12 @@ export default {
       return handleUrls(request, env);
     }
 
+    if (url.pathname === "/status") {
+      return handleLiveStatus(request, env);
+    }
+
     return new Response(
-      "gp-ext-workflow worker is running.\n\nEndpoints:\n  POST /telegram-webhook  (Telegram only)\n  GET  /urls?account=vsn|nch  (extracted urls)",
+      "gp-ext-workflow worker is running.\n\nEndpoints:\n  POST /telegram-webhook  (Telegram only)\n  GET  /urls?account=vsn|nch  (extracted urls)\n  GET  /status?account=vsn|nch  (live run progress)",
       { status: 200, headers: { "content-type": "text/plain" } }
     );
   },
@@ -180,6 +184,17 @@ async function getStatus(env, account) {
     runLine = `Could not fetch run status: ${e.message}`;
   }
 
+  let liveLine = "";
+  try {
+    // Single extra KV read -- written far more often than KV_STATE_KEY/KV_URLS_KEY
+    // (which only get persisted at batch/end/interrupt), so this is what makes a
+    // mid-run /status show what's happening RIGHT NOW instead of stale totals.
+    const live = await env.GP_URLS.get(`${account}:live_status`, "json");
+    if (live) liveLine = formatLiveStatus(live);
+  } catch (e) {
+    liveLine = `Live status read failed: ${e.message}`;
+  }
+
   let urlLine = "No dataset yet.";
   try {
     const data = await env.GP_URLS.get(`${account}:urls`, "json");
@@ -190,7 +205,63 @@ async function getStatus(env, account) {
     urlLine = `KV read failed: ${e.message}`;
   }
 
-  return `📊 ${acc.label} Status\n\n${runLine}\n\n${urlLine}`;
+  return `📊 ${acc.label} Status\n\n${runLine}${liveLine ? "\n\n" + liveLine : ""}\n\n${urlLine}`;
+}
+
+const LIVE_STATUS_LABEL = {
+  start: "🚀 starting",
+  scanning: "🔎 scanning",
+  flood: "🌊 flood-paused / aborted",
+  timeout: "⏰ self-stopped (time budget)",
+  idle: "✅ finished",
+  failed: "❌ failed",
+};
+
+function formatLiveStatus(live) {
+  const label = LIVE_STATUS_LABEL[live.status] || live.status || "unknown";
+  const lines = [`Live: ${label}`];
+  if (live.current_group) {
+    const members =
+      live.current_group_members != null ? `${live.current_group_members.toLocaleString()} members` : "members unknown";
+    lines.push(`Group #${live.dialog_number ?? "?"}: ${live.current_group} (${members})`);
+    lines.push(`Scanned in this group: ${live.messages_scanned_this_group ?? 0}`);
+  }
+  lines.push(`Total messages scanned this run: ${live.total_messages_scanned ?? 0}`);
+  lines.push(`Total urls found this run: ${live.total_urls_found_this_run ?? 0}`);
+  if (live.estimated_next_group_at) {
+    lines.push(`Est. next group swap: ~${new Date(live.estimated_next_group_at).toUTCString()} (rough estimate, not exact)`);
+  }
+  if (live.updated_at) {
+    lines.push(`(as of ${new Date(live.updated_at).toUTCString()})`);
+  }
+  return lines.join("\n");
+}
+
+async function handleLiveStatus(request, env) {
+  const url = new URL(request.url);
+
+  if (env.WORKER_AUTH_TOKEN) {
+    const auth = request.headers.get("Authorization");
+    if (auth !== `Bearer ${env.WORKER_AUTH_TOKEN}`) {
+      return new Response("Unauthorized", { status: 401 });
+    }
+  }
+
+  const account = url.searchParams.get("account");
+  if (!account || !ACCOUNTS[account]) {
+    return Response.json(
+      { error: "Missing or unknown ?account=. Valid values: " + Object.keys(ACCOUNTS).join(", ") },
+      { status: 400 }
+    );
+  }
+
+  // One KV read, nothing else -- no Telegram/GitHub API calls needed to see
+  // what an in-progress run is currently doing.
+  const live = await env.GP_URLS.get(`${account}:live_status`, "json");
+  if (!live) {
+    return Response.json({ error: "No live status yet. Run the extractor first." }, { status: 404 });
+  }
+  return Response.json({ account, ...live });
 }
 
 async function reply(env, chatId, text, inlineKeyboard) {

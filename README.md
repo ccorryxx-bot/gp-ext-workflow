@@ -115,32 +115,13 @@ back to raw regex extraction):
   `small_group`. A count that couldn't be determined (transient API failure)
   is treated as passing, not dropped -- see the docstring on
   `classify_telegram_url` for the reasoning.
-- If `MYANMAR_ONLY=1` (default), its title+about are checked for either
-  Myanmar script (Unicode U+1000-U+109F etc, catches Zawgyi too -- it
-  reuses codepoints in the same block) OR an English Myanmar-indicator
-  keyword (myanmar/burma/burmese/yangon/mandalay/naypyidaw, see
-  `MYANMAR_KEYWORD_RE`) -- neither found → dropped as `not_myanmar`. The
-  keyword fallback exists because plenty of genuine Myanmar groups (trading/
-  business ones especially) name and describe themselves entirely in Latin
-  script -- "Myanmar Trading Group" has zero Myanmar Unicode characters
-  despite being a Myanmar group; script-only detection would wrongly drop
-  it. No title/about text to judge from → treated as passing, not dropped,
-  same reasoning as the member-count case. Set `MYANMAR_ONLY=0` to turn
-  this off (member-count filtering still applies). This is still script/
-  keyword matching, not statistical language detection -- Myanmar's script
-  has zero overlap with Latin/Cyrillic, so a character-range + keyword
-  check is both faster and more reliable here than a language-ID library,
-  and it's deliberately biased toward keeping a url when uncertain rather
-  than dropping a real Myanmar group.
 - Non-Telegram URLs pass through unvalidated (kept as-is).
 
 Member counts and the about text both come free for not-yet-joined private
 invite links (embedded in the `CheckChatInviteRequest` response); for
-everything else, one `GetFullChannelRequest` call covers BOTH the
-member-count and language checks together -- not two separate calls. All
-of this (including the Myanmar-script result) is cached per url in
-`url_classifications`, so repeats -- within a run, across groups, across
-days -- cost nothing extra.
+everything else, one `GetFullChannelRequest` call covers the member-count
+check. All of this is cached per url in `url_classifications`, so repeats
+-- within a run, across groups, across days -- cost nothing extra.
 
 Kept urls also carry `title` and (up to 200 chars of) `about` when known --
 both come from data already fetched for the member-count/language checks,
@@ -159,7 +140,7 @@ taxonomy in `notify_status(status, text)`:
 
 | status    | emoji | when |
 |-----------|-------|------|
-| `start`   | 🚀    | run begins |
+| `start`   | 🚀    | run begins -- this message stays around and gets edited in place with live progress for the rest of the run, see "Live status" below |
 | `success` | ✅    | run finished normally (with a filtered-out breakdown if anything was dropped) |
 | `timeout` | ⏰    | self-stopped after `MAX_RUN_MINUTES` to leave time for a clean notice before the job's hard kill (see "Delivery pacing") |
 | `flood`   | 🌊    | FloodWait abort, a long FloodWait sleep, or PeerFlood |
@@ -167,6 +148,46 @@ taxonomy in `notify_status(status, text)`:
 | `error`   | ⚠️    | reserved for future use (mid-run degraded-but-continuing conditions) |
 
 Batch url deliveries keep their own 📦 prefix -- they're data, not a status.
+
+## Live status (mid-run visibility)
+
+`KV_STATE_KEY`/`KV_URLS_KEY` only get written at `persist()` -- batch time,
+end of run, or an abort -- so they can't show what a run is doing *right
+now*. Two things fix that, updated together from the same snapshot (on
+every dialog switch, every batch flush, and every 25 messages scanned
+within a dialog -- so groups with zero matching urls still update it, not
+just groups that produce a batch):
+
+1. **KV** -- `<account>:live_status` is overwritten in place with `status`
+   (`start`/`scanning`/`flood`/`timeout`/`idle`/`failed`), `current_group` +
+   `current_group_members` + `dialog_number` (member count is whatever
+   Telethon already loaded for the dialog list -- free, no extra API call;
+   often `null` for channels, which need a separate call this doesn't pay
+   for just to report a number), `messages_scanned_this_group` and
+   `total_messages_scanned` (this run), `total_urls_found_this_run`, and
+   `estimated_next_group_at` (projected from this run's actual observed
+   pace so far -- elapsed time ÷ messages scanned, so jitter sleeps and
+   batch rests are already baked into the rate, not just raw scan speed;
+   an estimate, not a promise). Reading it costs exactly one KV GET, no
+   Telegram or GitHub Actions API calls -- the bot's `/status [vsn|nch]`
+   command includes it automatically when a snapshot exists, and it's also
+   exposed directly over HTTP as `GET /status?account=vsn|nch` on the
+   Worker (same auth as `/urls`), for polling from anywhere else.
+
+2. **Bot chat** -- the same fields, formatted, are pushed live into the
+   🚀 start notice itself via `editMessageText`, so progress is visible
+   from the moment `/extract` is called without needing to ask `/status`.
+   It edits ONE message in place rather than sending a fresh ping on every
+   update (a zero-url group can hit this ~12 times over its
+   `MAX_SCAN_PER_DIALOG`, and a full round-robin run can cover dozens of
+   groups -- sending that many separate messages would flood the chat and
+   risk Telegram's own rate limit, documented as ~1 message/sec sustained
+   in a private chat or ~20/minute in a group chat for both `sendMessage`
+   and `editMessageText`; our real cadence, paced by the same jitter/rest
+   delays as everything else, stays well under either). This is entirely
+   separate from the *scraping* account's Telegram MTProto flood-wait risk
+   discussed elsewhere in this doc -- it's the bot account's own HTTP Bot
+   API, unrelated rate limit, unrelated account.
 
 ## Multiple Telegram accounts (VSN / NCH)
 

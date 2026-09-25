@@ -83,6 +83,16 @@ CF_KV_NAMESPACE_ID = os.environ["CF_KV_NAMESPACE_ID"]
 ACCOUNT = os.environ.get("ACCOUNT", "default")
 KV_STATE_KEY = f"{ACCOUNT}:state"
 KV_URLS_KEY = f"{ACCOUNT}:urls"
+# Lightweight, frequently-overwritten progress snapshot for the bot's
+# /status command -- separate from KV_STATE_KEY (which only gets written
+# at persist(), i.e. batch/end/interrupt) so a mid-run /status check can
+# see live progress with a single KV read, no extra Telegram/GH API calls.
+KV_LIVE_STATUS_KEY = f"{ACCOUNT}:live_status"
+# Id of the single bot message that gets EDITED in place with live progress
+# throughout the run (see update_live_message in run()) -- module level so
+# the top-level exception handler at the bottom of this file can also
+# finalize it on an unhandled error, not just code paths inside run().
+LIVE_MESSAGE_ID = [None]
 
 DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "50"))
 # Per-message/per-validation-call pacing is randomized within this range
@@ -136,36 +146,6 @@ def extract_urls_from_text(text):
     return [clean_url(u) for u in URL_REGEX.findall(text)]
 
 
-MYANMAR_SCRIPT_RE = re.compile(r'[\u1000-\u109F\uAA60-\uAA7F\uA9E0-\uA9FF]')
-# English-script fallback: many genuine Myanmar groups (especially trading/
-# business ones aiming for wider reach) name and describe themselves
-# entirely in Latin script -- "Myanmar Trading Group" has ZERO Myanmar
-# Unicode characters despite being a Myanmar group. Script-only detection
-# would wrongly drop these as 'not_myanmar'. This catches that case.
-# Deliberately excludes bare "MM"/"MMK" -- too short, too likely to
-# false-positive on unrelated titles; the tradeoff here is intentionally
-# biased toward keeping (a few extra non-Myanmar groups let through) over
-# dropping a real one, per explicit instruction -- tune this list if that
-# balance needs to shift.
-MYANMAR_KEYWORD_RE = re.compile(
-    r'\b(myanmar|burma|burmese|yangon|mandalay|naypyidaw|naypyitaw)\b', re.IGNORECASE
-)
-
-
-def looks_myanmar(text):
-    """True if text has Myanmar-script characters OR an English Myanmar-
-    indicator keyword (see MYANMAR_KEYWORD_RE) -- False only when NEITHER
-    signal is present. None if there's no text to judge from at all
-    (title+about both empty)."""
-    if not text or not text.strip():
-        return None
-    if MYANMAR_SCRIPT_RE.search(text):
-        return True
-    if MYANMAR_KEYWORD_RE.search(text):
-        return True
-    return False
-
-
 def get_group_details(client, obj):
     """obj is either a types.ChatInvite (not-yet-joined invite -- title,
     about, and participants_count are all already embedded in it, free) or
@@ -199,21 +179,13 @@ def get_group_details(client, obj):
     return None, None
 
 
-MYANMAR_ONLY = os.environ.get("MYANMAR_ONLY", "1") != "0"
-
-
-def _decide_kind(members, about, title):
+def _decide_kind(members):
     """Shared decision for every 'confirmed group' branch below: member
-    threshold first, then Myanmar-script presence in title+about. Neither
-    check can produce a false DROP from missing data -- None/unknown always
-    falls through to keeping it, per the same policy as the member-count
-    check (see classify_telegram_url docstring)."""
+    threshold only. A None/unknown member count (lookup failed) can't
+    produce a false DROP -- it always falls through to keeping the url,
+    same policy as before (see classify_telegram_url docstring)."""
     if members is not None and members <= MIN_GROUP_MEMBERS:
         return "small_group"
-    if MYANMAR_ONLY:
-        is_mm = looks_myanmar(f"{title or ''} {about or ''}")
-        if is_mm is False:
-            return "not_myanmar"
     return "group"
 
 
@@ -221,29 +193,25 @@ def classify_telegram_url(client, url):
     """Resolve a Telegram link against the live API and classify it.
 
     Returns a dict {"kind": <str>, "members": <int|None>}. kind is one of:
-      'group'        -- confirmed group/megagroup, passes member+language filters -- KEEP
+      'group'        -- confirmed group/megagroup, passes the member filter -- KEEP
       'small_group'   -- confirmed group/megagroup, <= MIN_GROUP_MEMBERS -- DROP
-      'not_myanmar'   -- confirmed group/megagroup, title+about has no Myanmar script -- DROP
       'channel'       -- confirmed broadcast channel -- DROP
       'expired'       -- private invite link, expired/revoked -- DROP
       'invalid'       -- link doesn't resolve to anything real -- DROP
       'not_telegram'  -- not a t.me/telegram.me link at all -- KEEP as-is (unvalidated)
       'unknown'       -- resolution failed for a transient reason (flood, etc) -- KEEP, unverified
 
-    A member count OR Myanmar-script presence that couldn't be determined
-    (missing data / a lookup call itself failed) is treated as passing
-    rather than dropped -- we'd rather keep an unverified url than lose
-    real data to a transient/missing-data issue. Only a *confirmed* small
-    count or *confirmed* non-Myanmar title+about gets dropped. Set
-    MYANMAR_ONLY=0 to disable the language filter entirely (member-count
-    filtering still applies).
+    A member count that couldn't be determined (missing data / a lookup
+    call itself failed) is treated as passing rather than dropped -- we'd
+    rather keep an unverified url than lose real data to a transient/
+    missing-data issue. Only a *confirmed* small count gets dropped.
 
     Costs one extra Telegram API call per *new* candidate URL for the
-    group/channel check, PLUS one more (GetFullChannelRequest) that covers
-    BOTH the member-count and the language checks together, unless it's a
-    not-yet-joined private invite link (that response already has
-    everything for free). Both are skipped entirely for URLs already in
-    `seen_urls`, and skippable globally via VALIDATE_URLS=0.
+    group/channel check, PLUS one more (GetFullChannelRequest) for the
+    member-count check, unless it's a not-yet-joined private invite link
+    (that response already has everything for free). Both are skipped
+    entirely for URLs already in `seen_urls`, and skippable globally via
+    VALIDATE_URLS=0.
     """
     m = TG_INVITE_HASH_REGEX.search(url)
     if m:
@@ -274,14 +242,14 @@ def classify_telegram_url(client, url):
             jitter_sleep()
             members, about = get_group_details(client, chat)
             title = getattr(chat, "title", None)
-            kind = _decide_kind(members, about, title)
+            kind = _decide_kind(members)
             return {"kind": kind, "members": members, "title": title, "about": about}
         if isinstance(result, types.ChatInvite):
             if getattr(result, "broadcast", False):
                 return {"kind": "channel", "members": None}
             members, about = get_group_details(client, result)  # free -- already in the response
             title = getattr(result, "title", None)
-            kind = _decide_kind(members, about, title)
+            kind = _decide_kind(members)
             return {"kind": kind, "members": members, "title": title, "about": about}
         return {"kind": "unknown", "members": None}
 
@@ -315,12 +283,12 @@ def classify_telegram_url(client, url):
             jitter_sleep()
             members, about = get_group_details(client, entity)
             title = getattr(entity, "title", None)
-            kind = _decide_kind(members, about, title)
+            kind = _decide_kind(members)
             return {"kind": kind, "members": members, "title": title, "about": about}
         if isinstance(entity, types.Chat):
             members, about = get_group_details(client, entity)  # free -- embedded on Chat
             title = getattr(entity, "title", None)
-            kind = _decide_kind(members, about, title)
+            kind = _decide_kind(members)
             return {"kind": kind, "members": members, "title": title, "about": about}
         return {"kind": "invalid", "members": None}  # resolved to a User or something else
 
@@ -347,13 +315,16 @@ def kv_put(key, value: dict):
     r.raise_for_status()
 
 
-def _send_telegram_message(text: str, parse_mode: str | None = None) -> bool:
+def _send_telegram_message(text: str, parse_mode: str | None = None) -> int | None:
     """Low-level sender. Every message is tagged with the account (e.g.
     "[VSN] ...") when ACCOUNT is set, so multiple accounts sharing one bot
-    chat stay distinguishable. Returns True only if Telegram confirmed
-    delivery (ok:true). Any failure -- network OR Telegram API rejection --
-    is surfaced as a GitHub Actions ::error:: annotation, so a silent bot
-    failure still shows up loudly in the run summary."""
+    chat stay distinguishable. Returns the sent message's message_id on
+    success (still truthy for existing `if not ok:` callers, AND usable by
+    callers that want to edit this exact message later -- see
+    _edit_telegram_message), or None if Telegram did not confirm delivery.
+    Any failure -- network OR Telegram API rejection -- is surfaced as a
+    GitHub Actions ::error:: annotation, so a silent bot failure still
+    shows up loudly in the run summary."""
     if ACCOUNT and ACCOUNT != "default":
         text = f"[{ACCOUNT.upper()}] {text}"
     payload = {"chat_id": BOT_CHAT_ID, "text": text, "disable_web_page_preview": True}
@@ -367,14 +338,42 @@ def _send_telegram_message(text: str, parse_mode: str | None = None) -> bool:
             data = {}
         if not r.ok or not data.get("ok"):
             print(f"::error::Bot ဆီကို message ပို့ မရပါ။ HTTP {r.status_code}: {r.text[:500]}")
+            return None
+        return data.get("result", {}).get("message_id")
+    except requests.RequestException as e:
+        print(f"::error::Bot ဆီကို message ပို့ မရပါ (connection error): {type(e).__name__}: {e}")
+        return None
+
+
+def _edit_telegram_message(message_id: int, text: str) -> bool:
+    """Edit an already-sent message in place -- used to keep ONE live-status
+    message current throughout a run instead of sending a new ping every
+    time (see update_live_message in run()). Same account-tag prefixing as
+    _send_telegram_message. "message is not modified" is Telegram's
+    response when the edit text is byte-identical to what's already there
+    -- harmless, not a real failure, so it's treated as success rather than
+    logged as an error."""
+    if ACCOUNT and ACCOUNT != "default":
+        text = f"[{ACCOUNT.upper()}] {text}"
+    payload = {"chat_id": BOT_CHAT_ID, "message_id": message_id, "text": text, "disable_web_page_preview": True}
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText", json=payload, timeout=15)
+        try:
+            data = r.json()
+        except ValueError:
+            data = {}
+        if not r.ok or not data.get("ok"):
+            if "message is not modified" in str(data.get("description", "")).lower():
+                return True
+            print(f"::warning::Live status message edit failed. HTTP {r.status_code}: {r.text[:300]}")
             return False
         return True
     except requests.RequestException as e:
-        print(f"::error::Bot ဆီကို message ပို့ မရပါ (connection error): {type(e).__name__}: {e}")
+        print(f"::warning::Live status message edit failed (connection error): {type(e).__name__}: {e}")
         return False
 
 
-def notify(text: str) -> bool:
+def notify(text: str) -> int | None:
     """Plain-text status ping to the bot chat."""
     return _send_telegram_message(text)
 
@@ -393,7 +392,7 @@ _STATUS_EMOJI = {
 }
 
 
-def notify_status(status: str, text: str) -> bool:
+def notify_status(status: str, text: str) -> int | None:
     emoji = _STATUS_EMOJI.get(status, "")
     return notify(f"{emoji} {text}".strip())
 
@@ -478,6 +477,24 @@ def time_budget_exceeded():
     return (datetime.now(timezone.utc) - RUN_START_TIME).total_seconds() > MAX_RUN_SECONDS
 
 
+def push_live_status(**fields):
+    """Best-effort progress snapshot, overwritten in place at KV_LIVE_STATUS_KEY
+    -- read back by the Worker's /status handler with a single KV GET (no
+    Telegram/GitHub API calls needed to see what a run is currently doing).
+    Never allowed to break the run: a KV write failure here is logged and
+    swallowed, since live status is a visibility nice-to-have, not core to
+    the extraction itself."""
+    try:
+        payload = {
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "run_started_at": RUN_START_TIME.isoformat(),
+        }
+        payload.update(fields)
+        kv_put(KV_LIVE_STATUS_KEY, payload)
+    except Exception as e:
+        print(f"::warning::live_status push failed (non-fatal): {type(e).__name__}: {e}")
+
+
 def run():
     state = kv_get(KV_STATE_KEY, {"cursors": {}, "seen_by_group": {}, "url_classifications": {}})
     cursors = state.get("cursors", {})
@@ -494,7 +511,7 @@ def run():
     groups_data = full_dataset.get("groups", {})
 
     new_urls_this_run = []
-    rejected = {"channel": 0, "expired": 0, "invalid": 0, "small_group": 0, "not_myanmar": 0}
+    rejected = {"channel": 0, "expired": 0, "invalid": 0, "small_group": 0}
     validation_calls = [0]  # mutable box, just for the final log line
 
     def persist():
@@ -543,8 +560,100 @@ def run():
             )
         pending_batch.clear()
         pending_batch_members.clear()
+        snapshot_live_status()  # batch pushes are a natural, already-existing cadence to piggyback a KV update on
 
-    notify_status("start", f"Extraction started. Target: {DAILY_LIMIT} new urls, max {MAX_NEW_URLS_PER_DIALOG}/group, >{MIN_GROUP_MEMBERS} members.")
+    # -- Live progress snapshot (KV push_live_status + edited bot message via
+    # update_live_message, both fed from the same `live` state below) --
+    # live: mutable, overwritten in place as scanning moves group to group.
+    # total_scanned_box: cumulative messages scanned across the WHOLE run
+    # (every group), used with elapsed wall-clock time to get an observed
+    # messages/second pace -- this naturally bakes in jitter sleeps and
+    # batch rests too, since both count as elapsed time, not just raw scan
+    # speed, so the pace is real rather than theoretical.
+    live = {
+        "current_group": None, "current_group_members": None,
+        "dialog_number": 0, "dialog_start_time": None,
+        "messages_scanned_this_group": 0,
+    }
+    total_scanned_box = [0]
+
+    def eta_next_group():
+        """Best-effort estimate of when scanning will move on to the next
+        group, from this run's observed pace so far. None if there's not
+        yet enough data (first few messages of the run) to estimate from.
+        This is an estimate, not a guarantee -- pace can shift a lot group
+        to group (URL density, flood waits, validation-call mix)."""
+        scanned_total = total_scanned_box[0]
+        if scanned_total == 0 or live["dialog_start_time"] is None:
+            return None
+        elapsed = (datetime.now(timezone.utc) - RUN_START_TIME).total_seconds()
+        avg_seconds_per_message = elapsed / scanned_total
+        remaining = max(0, MAX_SCAN_PER_DIALOG - live["messages_scanned_this_group"])
+        return datetime.now(timezone.utc) + timedelta(seconds=avg_seconds_per_message * remaining)
+
+    start_text = f"Extraction started. Target: {DAILY_LIMIT} new urls, max {MAX_NEW_URLS_PER_DIALOG}/group, >{MIN_GROUP_MEMBERS} members."
+
+    _LIVE_LABEL = {
+        "start": "starting",
+        "scanning": "🔎 scanning",
+        "flood": "🌊 flood-paused / aborted",
+        "timeout": "⏰ self-stopped (time budget)",
+        "idle": "✅ finished",
+        "failed": "❌ failed",
+    }
+
+    def build_live_text(status):
+        """The 🚀 start line stays as a permanent header (same text the
+        old static notice always showed) -- everything below it is live
+        and gets rewritten on every edit, per the explicit ask that this
+        info live IN the start message, not only in a separate /status
+        pull. Kept as one continuously-edited message rather than a new
+        ping per update -- see update_live_message for why."""
+        eta = eta_next_group()
+        lines = [f"{_STATUS_EMOJI['start']} {start_text}", "", f"📊 Live: {_LIVE_LABEL.get(status, status)}"]
+        if live["current_group"]:
+            members = live["current_group_members"]
+            members_txt = f"{members:,} members" if members is not None else "members unknown"
+            lines.append(f"Group #{live['dialog_number']}: {live['current_group']} ({members_txt})")
+            lines.append(f"Scanned in this group: {live['messages_scanned_this_group']}")
+        lines.append(f"Total messages scanned: {total_scanned_box[0]}")
+        lines.append(f"Total urls found: {len(new_urls_this_run)}")
+        if eta:
+            lines.append(f"Est. next group swap: ~{eta.strftime('%H:%M UTC')} (pace estimate, not exact)")
+        lines.append(f"⏱ Run duration: {format_elapsed()}")
+        return "\n".join(lines)
+
+    def update_live_message(status):
+        text = build_live_text(status)
+        if LIVE_MESSAGE_ID[0] is None:
+            # First call of the run -- this SEND is the start notice itself
+            # (same 🚀 text as before, now with live fields already attached).
+            LIVE_MESSAGE_ID[0] = notify(text)
+            return
+        ok = _edit_telegram_message(LIVE_MESSAGE_ID[0], text)
+        if not ok:
+            # Message likely deleted by the user, or a genuine edit failure --
+            # fall back to one fresh message rather than silently losing
+            # live visibility for the rest of the run.
+            LIVE_MESSAGE_ID[0] = notify(text)
+
+    def snapshot_live_status(status="scanning"):
+        eta = eta_next_group()
+        push_live_status(
+            status=status,
+            current_group=live["current_group"],
+            current_group_members=live["current_group_members"],
+            dialog_number=live["dialog_number"],
+            messages_scanned_this_group=live["messages_scanned_this_group"],
+            total_messages_scanned=total_scanned_box[0],
+            total_urls_found_this_run=len(new_urls_this_run),
+            rejected_this_run=dict(rejected),
+            estimated_next_group_at=eta.isoformat() if eta else None,
+            eta_note="estimate based on this run's average pace so far -- not exact" if eta else None,
+        )
+        update_live_message(status)
+
+    snapshot_live_status(status="start")
 
     current_gid = [None]  # mutable box so the except block can see the in-progress group
     stopped_for_time_budget = False
@@ -567,6 +676,17 @@ def run():
                 scanned = 0
                 new_from_this_dialog = 0
 
+                live["current_group"] = dialog.name
+                # Free -- already embedded in the dialog entity Telethon loaded for
+                # iter_dialogs, no extra API call. Only reliably populated for Chat;
+                # Channel usually needs GetFullChannelRequest to know this, which we
+                # don't pay for here just to report a status number.
+                live["current_group_members"] = getattr(dialog.entity, "participants_count", None)
+                live["dialog_number"] += 1
+                live["dialog_start_time"] = datetime.now(timezone.utc)
+                live["messages_scanned_this_group"] = 0
+                snapshot_live_status()
+
                 while (
                     len(new_urls_this_run) < DAILY_LIMIT
                     and new_from_this_dialog < MAX_NEW_URLS_PER_DIALOG
@@ -578,18 +698,34 @@ def run():
                             client.iter_messages(dialog, min_id=last_seen_id, reverse=True, limit=20)
                         )
                     except FloodWaitError as e:
-                        if e.seconds > FLOOD_ABORT_SECONDS:
+                        # A flood wait doesn't just have to fit under FLOOD_ABORT_SECONDS
+                        # to be safe to sleep out -- it also has to fit under what's LEFT
+                        # of MAX_RUN_SECONDS. Blind-sleeping a 3-4h flood wait can carry
+                        # the run straight through the self-imposed time budget and into
+                        # GitHub's hard timeout-minutes kill -- an OS-level kill that no
+                        # try/except/notify can react to (that silent-cancel failure mode
+                        # is exactly what MAX_RUN_MINUTES exists to prevent elsewhere, so
+                        # it has to be honored here too, not just at the outer loop checks).
+                        elapsed_now = (datetime.now(timezone.utc) - RUN_START_TIME).total_seconds()
+                        would_exceed_budget = elapsed_now + e.seconds > MAX_RUN_SECONDS
+                        if e.seconds > FLOOD_ABORT_SECONDS or would_exceed_budget:
                             resume_at = datetime.now(timezone.utc) + timedelta(seconds=e.seconds)
                             flush_pending_batch()
+                            reason = (
+                                f"{FLOOD_ABORT_SECONDS // 3600}h ကျော်လို့"
+                                if e.seconds > FLOOD_ABORT_SECONDS
+                                else "ဒီ wait ကို အပြည့်စောင့်ရင် run time budget ကျော်သွားမှာမို့"
+                            )
                             notify_status(
                                 "flood",
                                 f"Flood wait -{e.seconds}s (~{e.seconds/3600:.1f}h) ကြုံရပါတယ်.\n"
-                                f"{FLOOD_ABORT_SECONDS // 3600}h ကျော်လို့ workflow ကို ရပ်လိုက်ပါပြီ။🎯\n"
+                                f"{reason} workflow ကို ရပ်လိုက်ပါပြီ။🎯\n"
                                 f"Resume ဖြစ်မည့် အချိန်: {resume_at.strftime('%Y-%m-%d %H:%M UTC')}\n"
                                 f"⏱ Run duration: {format_elapsed()}"
                             )
                             cursors[gid] = last_seen_id
                             persist()
+                            snapshot_live_status(status="flood")
                             sys.exit(1)
                         else:
                             if e.seconds > 30:
@@ -602,8 +738,19 @@ def run():
 
                     for message in messages:
                         scanned += 1
+                        total_scanned_box[0] += 1
+                        live["messages_scanned_this_group"] = scanned
                         last_seen_id = max(last_seen_id, message.id)
                         did_fresh_classify = False  # true if any url below triggered a real API call
+
+                        # Groups with zero matching urls (all filtered, or genuinely
+                        # none posted) can otherwise go the whole MAX_SCAN_PER_DIALOG
+                        # without a single batch flush -- that's exactly the "run for
+                        # hours, no visibility into what's happening" gap. Piggyback a
+                        # cheap update every 25 messages so both /status AND the live
+                        # bot message (see update_live_message) stay current even then.
+                        if total_scanned_box[0] % 25 == 0:
+                            snapshot_live_status()
 
                         for u in extract_urls_from_text(message.raw_text):
                             if u in gid_seen:
@@ -621,7 +768,7 @@ def run():
                             if about:
                                 about = about.strip()[:200]  # keep the KV dataset lean
 
-                            if kind in ("channel", "expired", "invalid", "small_group", "not_myanmar"):
+                            if kind in ("channel", "expired", "invalid", "small_group"):
                                 gid_seen.add(u)  # never re-check for this group again
                                 rejected[kind] += 1
                                 continue
@@ -695,6 +842,7 @@ def run():
             "Workflow ကို ရပ်လိုက်ပါပြီ. ခဏနားပြီးမှ /extract ကို ပြန်စမ်းပါ (24h+ စောင့်ဖို့ recommend).\n"
             f"⏱ Run duration: {format_elapsed()}"
         )
+        snapshot_live_status(status="flood")
         sys.exit(1)
 
     flush_pending_batch()
@@ -705,7 +853,6 @@ def run():
         filtered_note = (
             f"\n🧹 Filtered out -- channel: {rejected.get('channel', 0)}, "
             f"small_group (≤{MIN_GROUP_MEMBERS}): {rejected.get('small_group', 0)}, "
-            f"not_myanmar: {rejected.get('not_myanmar', 0)}, "
             f"expired: {rejected.get('expired', 0)}, invalid: {rejected.get('invalid', 0)}"
         )
     if stopped_for_time_budget:
@@ -718,6 +865,7 @@ def run():
             f"Cursor state save ပြီးသားမို့ နောက် run ကျရင် ရပ်ခဲ့တဲ့နေရာကနေ ဆက်မယ်.\n"
             f"⏱ Run duration: {format_elapsed()}"
         )
+        snapshot_live_status(status="timeout")
     else:
         notify_status(
             "success",
@@ -726,6 +874,7 @@ def run():
             f"{filtered_note}\n"
             f"⏱ Run duration: {format_elapsed()}"
         )
+        snapshot_live_status(status="idle")
     print(
         f"DONE: {len(new_urls_this_run)} new urls this run. Total (group,url) records: {total_records}. "
         f"Rejected: {rejected}. Telegram validation API calls this run: {validation_calls[0]}. "
@@ -745,4 +894,10 @@ if __name__ == "__main__":
         # (no bot message AND nothing visible) is no longer possible.
         print(f"::error::Action ရပ်သွားခဲ့သည်, ဘာဖြစ်လို့ error: {err_msg}")
         notify_status("failed", f"Error ကြောင့် workflow ရပ်သွားပါတယ်:\n{err_msg}\n⏱ Run duration: {format_elapsed()}")
+        push_live_status(status="failed", error=err_msg)
+        if LIVE_MESSAGE_ID[0] is not None:
+            _edit_telegram_message(
+                LIVE_MESSAGE_ID[0],
+                f"❌ failed -- {err_msg}\n⏱ Run duration: {format_elapsed()}",
+            )
         raise
