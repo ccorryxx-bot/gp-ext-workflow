@@ -83,6 +83,11 @@ async function handleWebhook(request, env) {
       const nch = await getStatus(env, "nch");
       await reply(env, chatId, `${vsn}\n\n----------\n\n${nch}`);
     }
+  } else if (cmd === "/skipped") {
+    const accts = arg === "vsn" || arg === "nch" ? [arg] : ["vsn", "nch"];
+    for (const a of accts) {
+      await sendSkippedList(env, chatId, a);
+    }
   } else if (cmd === "/help" || cmd === "/start") {
     await reply(
       env,
@@ -90,13 +95,35 @@ async function handleWebhook(request, env) {
       "Commands:\n" +
         "/extract - run extraction now (asks VSN / NCH / Both)\n" +
         "/status [vsn|nch] - latest run status + total urls (both if no arg)\n" +
-        "/help - this message"
+        "/skipped [vsn|nch] - list manually-skipped groups, with unskip buttons\n" +
+        "/help - this message\n\n" +
+        "During a run, the live status message has a '⏭ Skip this group' button -- " +
+        "tap it to permanently exclude whatever group is currently being scanned " +
+        "from all future runs (manual decision, not automatic)."
     );
   } else {
     await reply(env, chatId, "Unknown command. Try /help");
   }
 
   return new Response("ok");
+}
+
+async function sendSkippedList(env, chatId, account) {
+  const key = `${account}:excluded_groups`;
+  const excluded = (await env.GP_URLS.get(key, "json")) || {};
+  const entries = Object.entries(excluded);
+  const label = ACCOUNTS[account].label;
+  if (!entries.length) {
+    await reply(env, chatId, `${label}: skip လုပ်ထားတဲ့ group မရှိသေးပါဘူး။`);
+    return;
+  }
+  const lines = entries.map(
+    ([gid, info], i) => `${i + 1}. ${info.name || gid} (skipped ${(info.excluded_at || "").slice(0, 10) || "?"})`
+  );
+  const buttons = entries.map(([gid, info]) => [
+    { text: `♻️ Unskip: ${(info.name || gid).slice(0, 30)}`, callback_data: `unskip:${account}:${gid}` },
+  ]);
+  await reply(env, chatId, `${label} skipped groups:\n\n${lines.join("\n")}`, { inline_keyboard: buttons });
 }
 
 async function handleCallbackQuery(cq, env) {
@@ -107,13 +134,21 @@ async function handleCallbackQuery(cq, env) {
   }
 
   const data = cq.data || "";
-  const [action, target] = data.split(":");
+  const [action] = data.split(":");
 
-  if (action !== "extract") {
+  if (action === "extract") {
+    await handleExtractCallback(cq, env, chatId, data);
+  } else if (action === "skip") {
+    await handleSkipCallback(cq, env, chatId, data, true);
+  } else if (action === "unskip") {
+    await handleSkipCallback(cq, env, chatId, data, false);
+  } else {
     await answerCallback(env, cq.id, "Unknown action");
-    return;
   }
+}
 
+async function handleExtractCallback(cq, env, chatId, data) {
+  const [, target] = data.split(":");
   const targets = target === "both" ? ["vsn", "nch"] : [target];
   const validTargets = targets.filter((t) => ACCOUNTS[t]);
 
@@ -135,6 +170,49 @@ async function handleCallbackQuery(cq, env) {
   }
 
   await reply(env, chatId, `🚀 Extraction request:\n\n${results.join("\n")}`);
+}
+
+async function handleSkipCallback(cq, env, chatId, data, excluding) {
+  // callback_data: "skip:<account>:<gid>" or "unskip:<account>:<gid>". gid
+  // itself is a plain signed integer (Telegram chat id), no colons in it,
+  // so a straight split is safe.
+  const parts = data.split(":");
+  const account = parts[1];
+  const gid = parts[2];
+
+  if (!ACCOUNTS[account] || !gid) {
+    await answerCallback(env, cq.id, "Bad request");
+    return;
+  }
+
+  const key = `${account}:excluded_groups`;
+  const current = (await env.GP_URLS.get(key, "json")) || {};
+
+  if (excluding) {
+    // Best-effort label from whatever the live snapshot currently shows for
+    // this group -- purely cosmetic for /skipped, not load-bearing (the
+    // extractor only ever checks gid membership, never the name).
+    let label = gid;
+    try {
+      const live = await env.GP_URLS.get(`${account}:live_status`, "json");
+      if (live && String(live.current_group_id) === String(gid) && live.current_group) {
+        label = live.current_group;
+      }
+    } catch {
+      // non-fatal -- fall back to the bare gid as the label
+    }
+    current[gid] = { name: label, excluded_at: new Date().toISOString() };
+    await env.GP_URLS.put(key, JSON.stringify(current));
+    await answerCallback(env, cq.id, `⏭ Skipped: ${label}`);
+    await reply(env, chatId, `⏭ "${label}" ကို နောက် run တွေမှာ scan မလုပ်တော့ပါဘူး (/skipped ${account} နဲ့ ပြန်ကြည့်/ပြန်ဖျက်လို့ရတယ်)။`);
+  } else {
+    const label = current[gid]?.name || gid;
+    delete current[gid];
+    await env.GP_URLS.put(key, JSON.stringify(current));
+    await answerCallback(env, cq.id, `♻️ Unskipped: ${label}`);
+    // Refresh the list message in place so removed entries disappear immediately.
+    await sendSkippedList(env, chatId, account);
+  }
 }
 
 async function triggerWorkflow(env, workflowFile) {

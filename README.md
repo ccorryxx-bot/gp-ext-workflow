@@ -189,6 +189,28 @@ just groups that produce a batch):
    discussed elsewhere in this doc -- it's the bot account's own HTTP Bot
    API, unrelated rate limit, unrelated account.
 
+## Skipping groups manually
+
+The live message's `⏭ Skip this group` button always targets whichever
+group is currently active in `live["current_group_id"]` (re-sent as part
+of `reply_markup` on every edit, so it never goes stale). Tapping it:
+
+- Writes `{gid: {name, excluded_at}}` into `<account>:excluded_groups` in KV
+- The extractor loads that set once at the start of every future run and
+  `continue`s past any dialog whose id is in it -- before doing any scan
+  work, so a skipped group costs nothing going forward
+
+This is a **manual curation decision, not an automatic one** -- "0 urls
+found so far" in the live message is not by itself evidence a group is
+worth skipping; it may simply not have been scanned yet this run (check
+`messages_scanned_this_group` first). Nothing in the extractor ever writes
+to this list on its own.
+
+`/skipped [vsn|nch]` lists everything currently excluded for an account,
+each with a `♻️ Unskip` button that removes it from the set (and future
+runs will scan it again, from wherever its `cursors` entry last left off
+-- skipping never touches or resets cursor state).
+
 ## Multiple Telegram accounts (VSN / NCH)
 
 This repo can run extraction for more than one Telegram account against the

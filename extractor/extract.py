@@ -88,6 +88,7 @@ KV_URLS_KEY = f"{ACCOUNT}:urls"
 # at persist(), i.e. batch/end/interrupt) so a mid-run /status check can
 # see live progress with a single KV read, no extra Telegram/GH API calls.
 KV_LIVE_STATUS_KEY = f"{ACCOUNT}:live_status"
+KV_EXCLUDED_KEY = f"{ACCOUNT}:excluded_groups"
 # Id of the single bot message that gets EDITED in place with live progress
 # throughout the run (see update_live_message in run()) -- module level so
 # the top-level exception handler at the bottom of this file can also
@@ -315,7 +316,7 @@ def kv_put(key, value: dict):
     r.raise_for_status()
 
 
-def _send_telegram_message(text: str, parse_mode: str | None = None) -> int | None:
+def _send_telegram_message(text: str, parse_mode: str | None = None, reply_markup: dict | None = None) -> int | None:
     """Low-level sender. Every message is tagged with the account (e.g.
     "[VSN] ...") when ACCOUNT is set, so multiple accounts sharing one bot
     chat stay distinguishable. Returns the sent message's message_id on
@@ -330,6 +331,8 @@ def _send_telegram_message(text: str, parse_mode: str | None = None) -> int | No
     payload = {"chat_id": BOT_CHAT_ID, "text": text, "disable_web_page_preview": True}
     if parse_mode:
         payload["parse_mode"] = parse_mode
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
     try:
         r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json=payload, timeout=15)
         try:
@@ -345,17 +348,22 @@ def _send_telegram_message(text: str, parse_mode: str | None = None) -> int | No
         return None
 
 
-def _edit_telegram_message(message_id: int, text: str) -> bool:
+def _edit_telegram_message(message_id: int, text: str, reply_markup: dict | None = None) -> bool:
     """Edit an already-sent message in place -- used to keep ONE live-status
     message current throughout a run instead of sending a new ping every
     time (see update_live_message in run()). Same account-tag prefixing as
-    _send_telegram_message. "message is not modified" is Telegram's
-    response when the edit text is byte-identical to what's already there
-    -- harmless, not a real failure, so it's treated as success rather than
+    _send_telegram_message. reply_markup is re-sent on every edit (not just
+    the first send) because it has to track whichever group is CURRENTLY
+    being scanned -- the skip button's callback_data changes as scanning
+    moves group to group. "message is not modified" is Telegram's response
+    when the edit text+markup is byte-identical to what's already there --
+    harmless, not a real failure, so it's treated as success rather than
     logged as an error."""
     if ACCOUNT and ACCOUNT != "default":
         text = f"[{ACCOUNT.upper()}] {text}"
     payload = {"chat_id": BOT_CHAT_ID, "message_id": message_id, "text": text, "disable_web_page_preview": True}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
     try:
         r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText", json=payload, timeout=15)
         try:
@@ -373,9 +381,9 @@ def _edit_telegram_message(message_id: int, text: str) -> bool:
         return False
 
 
-def notify(text: str) -> int | None:
+def notify(text: str, reply_markup: dict | None = None) -> int | None:
     """Plain-text status ping to the bot chat."""
-    return _send_telegram_message(text)
+    return _send_telegram_message(text, reply_markup=reply_markup)
 
 
 # Unified status taxonomy for run-level notices (start / success / failed /
@@ -507,6 +515,12 @@ def run():
     # different groups only ever costs its API call(s) once, not 5 times.
     url_classifications = dict(state.get("url_classifications", {}))
 
+    # Groups excluded via the Telegram "⏭ Skip this group" button (see
+    # update_live_message/build_reply_markup below) or the bot's /skipped
+    # unskip flow -- written by the Worker, read-only here. gid -> {"name":
+    # str, "excluded_at": iso str}. Loaded once per run, not per dialog.
+    excluded_groups = kv_get(KV_EXCLUDED_KEY, {})
+
     full_dataset = kv_get(KV_URLS_KEY, {"groups": {}})
     groups_data = full_dataset.get("groups", {})
 
@@ -571,7 +585,7 @@ def run():
     # batch rests too, since both count as elapsed time, not just raw scan
     # speed, so the pace is real rather than theoretical.
     live = {
-        "current_group": None, "current_group_members": None,
+        "current_group": None, "current_group_id": None, "current_group_members": None,
         "dialog_number": 0, "dialog_start_time": None,
         "messages_scanned_this_group": 0,
     }
@@ -623,25 +637,44 @@ def run():
         lines.append(f"⏱ Run duration: {format_elapsed()}")
         return "\n".join(lines)
 
+    def build_reply_markup():
+        """Skip button for whatever group is CURRENTLY being scanned --
+        omitted entirely before the first group starts (nothing to skip
+        yet). This is a MANUAL curation tool, not tied to '0 urls found so
+        far' -- that number alone is not evidence a group is empty, it may
+        simply not have been scanned yet (see messages_scanned_this_group).
+        Re-sent on every edit so the callback_data always points at
+        whichever group is active at that moment, not a stale one."""
+        gid = live["current_group_id"]
+        if not gid:
+            return None
+        return {
+            "inline_keyboard": [[
+                {"text": "⏭ Skip this group (don't scan again)", "callback_data": f"skip:{ACCOUNT}:{gid}"}
+            ]]
+        }
+
     def update_live_message(status):
         text = build_live_text(status)
+        markup = build_reply_markup()
         if LIVE_MESSAGE_ID[0] is None:
             # First call of the run -- this SEND is the start notice itself
             # (same 🚀 text as before, now with live fields already attached).
-            LIVE_MESSAGE_ID[0] = notify(text)
+            LIVE_MESSAGE_ID[0] = notify(text, reply_markup=markup)
             return
-        ok = _edit_telegram_message(LIVE_MESSAGE_ID[0], text)
+        ok = _edit_telegram_message(LIVE_MESSAGE_ID[0], text, reply_markup=markup)
         if not ok:
             # Message likely deleted by the user, or a genuine edit failure --
             # fall back to one fresh message rather than silently losing
             # live visibility for the rest of the run.
-            LIVE_MESSAGE_ID[0] = notify(text)
+            LIVE_MESSAGE_ID[0] = notify(text, reply_markup=markup)
 
     def snapshot_live_status(status="scanning"):
         eta = eta_next_group()
         push_live_status(
             status=status,
             current_group=live["current_group"],
+            current_group_id=live["current_group_id"],
             current_group_members=live["current_group_members"],
             dialog_number=live["dialog_number"],
             messages_scanned_this_group=live["messages_scanned_this_group"],
@@ -670,6 +703,9 @@ def run():
                     continue
 
                 gid = str(dialog.id)
+                if gid in excluded_groups:
+                    continue
+
                 current_gid[0] = gid
                 last_seen_id = cursors.get(gid, 0)
                 gid_seen = seen_by_group.setdefault(gid, set())
@@ -677,6 +713,7 @@ def run():
                 new_from_this_dialog = 0
 
                 live["current_group"] = dialog.name
+                live["current_group_id"] = gid
                 # Free -- already embedded in the dialog entity Telethon loaded for
                 # iter_dialogs, no extra API call. Only reliably populated for Chat;
                 # Channel usually needs GetFullChannelRequest to know this, which we
