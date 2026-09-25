@@ -78,7 +78,16 @@ persisted to KV before it exits, and cursors resume next run from exactly
 where it stopped.
 
 Each batch (and the final summary) is sent as a native-monospace,
-tap-to-copy bracketed list: `[https://t.me/a,https://t.me/b,...]`.
+tap-to-copy numbered list, one url per line:
+```
+1. https://t.me/a
+2. https://t.me/b
+```
+(previously a comma-joined `[a,b,...]` blob -- that glued `[`/`]`/`,`
+directly onto url edges with no separating whitespace, which made some
+downstream tools mis-parse the first/last url as invalid; nothing is ever
+flush against a url's edges now, only a leading `"N. "` and a trailing
+newline.)
 
 ## Round-robin across groups
 

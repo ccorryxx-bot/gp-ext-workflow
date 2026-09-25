@@ -447,17 +447,20 @@ def format_elapsed(start_time=None):
 
 
 def _chunk_urls_by_length(urls, max_len=3500):
-    """Group urls into chunks whose bracketed-list rendering stays under
-    Telegram's 4096-char message cap (max_len leaves headroom for the
-    <code> wrapper and any header text)."""
-    chunks, current, current_len = [], [], 2  # 2 == the "[" "]"
+    """Group urls into chunks whose numbered-list rendering (inside a
+    <pre> block) stays under Telegram's 4096-char message cap (max_len
+    leaves headroom for the wrapper and any header text). Sized using the
+    final numbering width (len(urls)) so an entry's estimated length
+    doesn't shift as more urls get added within the same chunk."""
+    num_width = len(str(len(urls)))
+    chunks, current, current_len = [], [], 0
     for u in urls:
-        add_len = len(u) + (1 if current else 0)  # +1 for the joining comma
-        if current and current_len + add_len > max_len:
+        entry_len = num_width + 2 + len(u) + 1  # "NNN. " + url + "\n"
+        if current and current_len + entry_len > max_len:
             chunks.append(current)
-            current, current_len = [], 2
+            current, current_len = [], 0
         current.append(u)
-        current_len += add_len
+        current_len += entry_len
     if current:
         chunks.append(current)
     return chunks or [[]]
@@ -465,9 +468,22 @@ def _chunk_urls_by_length(urls, max_len=3500):
 
 def send_url_batch(urls, header: str | None = None) -> bool:
     """Push a batch of urls to the bot as a native-monospace, tap-to-copy
-    bracketed list: [https://a,https://b,https://c]. Returns False (and
-    logs ::error::) if ANY chunk fails to deliver -- caller decides whether
-    that should fail the run."""
+    NUMBERED LIST, one url per line:
+        1. https://a
+        2. https://b
+        3. https://c
+    Nothing is ever glued directly onto a url's edges -- only a space
+    before it ("N. ") and a newline after it. A bracketed/comma-joined
+    blob (the previous format) puts a "[" flush against the first url and
+    "]" flush against the last with no separating whitespace -- Telegram's
+    (and most other tools') url-boundary detection can then swallow that
+    bracket as part of the url and calls the whole thing invalid. That's a
+    pure formatting bug, not a data problem -- the urls stored in KV were
+    always clean; only this rendering glued extra characters onto them.
+    Numbering is continuous across chunks (idx_offset) so a batch split
+    into multiple messages still reads as one ordered list. Returns False
+    (and logs ::error::) if ANY chunk fails to deliver -- caller decides
+    whether that should fail the run."""
     if not urls:
         if header:
             return notify(header)
@@ -475,15 +491,17 @@ def send_url_batch(urls, header: str | None = None) -> bool:
 
     ok_all = True
     chunks = _chunk_urls_by_length(urls)
+    idx_offset = 0
     for idx, chunk in enumerate(chunks):
-        body = "[" + ",".join(chunk) + "]"
-        text = f"<code>{html.escape(body)}</code>"
+        body = "\n".join(f"{idx_offset + i}. {u}" for i, u in enumerate(chunk, start=1))
+        text = f"<pre>{html.escape(body)}</pre>"
         if header and idx == 0:
             text = f"{html.escape(header)}\n\n{text}"
         ok = _send_telegram_message(text, parse_mode="HTML")
         if not ok:
             print(f"::error::Url batch chunk {idx+1}/{len(chunks)} ({len(chunk)} url(s)) Bot ဆီ ပို့ မရပါ။")
         ok_all = ok_all and ok
+        idx_offset += len(chunk)
         time.sleep(1)
     return ok_all
 
