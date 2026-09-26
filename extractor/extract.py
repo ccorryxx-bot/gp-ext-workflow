@@ -115,7 +115,7 @@ BATCH_REST_MIN_SECONDS = int(os.environ.get("BATCH_REST_MIN_MINUTES", "15")) * 6
 BATCH_REST_MAX_SECONDS = int(os.environ.get("BATCH_REST_MAX_MINUTES", "30")) * 60
 
 URL_REGEX = re.compile(
-    r'(?:https?://|www\.|t\.me/|telegram\.me/)[^\s<>"\')\]]+',
+    r'(?:https?://)?(?:t\.me|telegram\.me)/[^\s<>"\')\]]+',
     re.IGNORECASE,
 )
 
@@ -224,7 +224,13 @@ def classify_telegram_url(client, url):
       'channel'       -- confirmed broadcast channel -- DROP
       'expired'       -- private invite link, expired/revoked -- DROP
       'invalid'       -- link doesn't resolve to anything real -- DROP
-      'not_telegram'  -- not a t.me/telegram.me link at all -- KEEP as-is (unvalidated)
+      'not_telegram'  -- doesn't resolve to a real Telegram invite/username at
+                         all (e.g. a t.me/joinchat/, t.me/proxy, t.me/share
+                         reserved path) -- KEEP as-is (unvalidated). Since
+                         URL_REGEX (above) now only matches t.me/telegram.me
+                         links, this is a narrow edge case, not a catch-all
+                         for non-Telegram domains anymore (see git history --
+                         it used to also swallow Viber/WhatsApp/etc. links).
       'unknown'       -- resolution failed for a transient reason (flood, etc) -- KEEP, unverified
 
     A member count that couldn't be determined (missing data / a lookup
