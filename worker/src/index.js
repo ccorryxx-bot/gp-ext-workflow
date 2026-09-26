@@ -8,6 +8,21 @@ const ACCOUNTS = {
   nch: { label: "NCH", workflowFile: "extract-nch.yml" },
 };
 
+// Single source of truth for every command this bot understands. Telegram's
+// slash-command menu (the "Menu" button popup) is NOT auto-detected from this
+// webhook code -- it's a separate piece of config on Telegram's side, only
+// updated when we explicitly call the setMyCommands Bot API method. Adding a
+// command here does nothing to the menu by itself; run /sync_menu afterward
+// (or via BotFather) to actually push this list to Telegram.
+const BOT_COMMANDS = [
+  { command: "start", description: "Show available commands" },
+  { command: "help", description: "Show available commands" },
+  { command: "extract", description: "Run extraction (asks VSN / NCH / Both)" },
+  { command: "status", description: "Latest run status + total urls" },
+  { command: "skipped", description: "List manually-skipped groups" },
+  { command: "sync_menu", description: "Re-sync this command list to Telegram's menu" },
+];
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -89,18 +104,24 @@ async function handleWebhook(request, env) {
       await sendSkippedList(env, chatId, a);
     }
   } else if (cmd === "/help" || cmd === "/start") {
+    const list = BOT_COMMANDS.filter((c) => c.command !== "start")
+      .map((c) => `/${c.command} - ${c.description}`)
+      .join("\n");
     await reply(
       env,
       chatId,
-      "Commands:\n" +
-        "/extract - run extraction now (asks VSN / NCH / Both)\n" +
-        "/status [vsn|nch] - latest run status + total urls (both if no arg)\n" +
-        "/skipped [vsn|nch] - list manually-skipped groups, with unskip buttons\n" +
-        "/help - this message\n\n" +
+      `Commands:\n${list}\n\n` +
         "During a run, the live status message has a '⏭ Skip this group' button -- " +
         "tap it to permanently exclude whatever group is currently being scanned " +
         "from all future runs (manual decision, not automatic)."
     );
+  } else if (cmd === "/sync_menu") {
+    try {
+      await syncBotCommands(env);
+      await reply(env, chatId, `✅ Menu synced -- ${BOT_COMMANDS.length} commands pushed to Telegram.`);
+    } catch (e) {
+      await reply(env, chatId, `❌ Menu sync failed: ${e.message}`);
+    }
   } else {
     await reply(env, chatId, "Unknown command. Try /help");
   }
@@ -358,6 +379,18 @@ async function reply(env, chatId, text, inlineKeyboard) {
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
   });
+}
+
+async function syncBotCommands(env) {
+  const resp = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/setMyCommands`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ commands: BOT_COMMANDS }),
+  });
+  const data = await resp.json();
+  if (!data.ok) {
+    throw new Error(data.description || `HTTP ${resp.status}`);
+  }
 }
 
 async function answerCallback(env, callbackQueryId, text) {
