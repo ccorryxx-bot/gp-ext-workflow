@@ -183,6 +183,14 @@ async function handleExtractCallback(cq, env, chatId, data) {
   const results = [];
   for (const t of validTargets) {
     try {
+      const running = await getActiveRun(env, ACCOUNTS[t].workflowFile);
+      if (running) {
+        results.push(
+          `⚠️ ${ACCOUNTS[t].label}: လက်ရှိ runner process ရှိနေတယ် (${running.status}, started ${running.run_started_at}).\n` +
+            `ဒီ run မပြီးခင် ထပ် trigger မလုပ်ပါနဲ့ -- session revoke ခံရနိုင်တယ်။ run ပြီးမှ ပြန် run ပါ။\n${running.html_url}`
+        );
+        continue;
+      }
       await triggerWorkflow(env, ACCOUNTS[t].workflowFile);
       results.push(`✅ ${ACCOUNTS[t].label}: workflow triggered`);
     } catch (e) {
@@ -233,6 +241,36 @@ async function handleSkipCallback(cq, env, chatId, data, excluding) {
     await answerCallback(env, cq.id, `♻️ Unskipped: ${label}`);
     // Refresh the list message in place so removed entries disappear immediately.
     await sendSkippedList(env, chatId, account);
+  }
+}
+
+// Checks GitHub's own record of the latest run for this workflow file --
+// not the extractor's live_status KV -- because KV can go stale if a run
+// crashes without writing a final status. GitHub's queued/in_progress state
+// is the source of truth for "is a session currently in use".
+// Fails open (returns null -> trigger proceeds) if the API call itself
+// errors, so a flaky status check never blocks a legitimate run.
+async function getActiveRun(env, workflowFile) {
+  try {
+    const resp = await fetch(
+      `https://api.github.com/repos/${REPO}/actions/workflows/${workflowFile}/runs?per_page=1`,
+      {
+        headers: {
+          Authorization: `token ${env.GH_PAT}`,
+          Accept: "application/vnd.github+json",
+          "User-Agent": "gp-ext-worker",
+        },
+      }
+    );
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    const run = data.workflow_runs && data.workflow_runs[0];
+    if (run && (run.status === "in_progress" || run.status === "queued")) {
+      return run;
+    }
+    return null;
+  } catch {
+    return null;
   }
 }
 
