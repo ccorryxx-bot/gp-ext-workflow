@@ -144,7 +144,15 @@ KV_HEADERS = {"Authorization": f"Bearer {CF_API_TOKEN}"}
 
 
 def clean_url(u: str) -> str:
-    return u.rstrip(".,)]}\u3002\uff0c")
+    u = u.rstrip(".,)]}\u3002\uff0c")
+    # URL_REGEX's (?:https?://)? is intentionally optional so we still catch
+    # links posted without a scheme (e.g. "t.me/xxx") -- but downstream (batch
+    # output, dedup keys in gid_seen/delivered_urls_fallback/url_classifications)
+    # needs one consistent form, or "t.me/x" and "https://t.me/x" get treated
+    # as two different urls for the same group. Normalize here, once.
+    if not u.lower().startswith(("http://", "https://")):
+        u = "https://" + u
+    return u
 
 
 def extract_urls_from_text(text):
