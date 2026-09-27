@@ -125,6 +125,14 @@ URL_REGEX = re.compile(
     re.IGNORECASE,
 )
 
+# t.me/nft/<Name>-<num> -- Telegram's built-in Unique Gift (collectible NFT)
+# page, not a group/channel at all. Its first path segment "nft" happens to
+# be too short (3 chars) to ever match TG_USERNAME_REGEX's 4-char minimum, so
+# it always fell through to the generic 'not_telegram' catch-all and got kept
+# alongside real unclassifiable links. Give it its own kind so it's dropped
+# explicitly instead of relying on that length coincidence.
+TG_NFT_GIFT_REGEX = re.compile(r'(?:t\.me|telegram\.me)/nft/', re.IGNORECASE)
+
 # t.me/joinchat/HASH or t.me/+HASH -- private invite links (need CheckChatInviteRequest)
 TG_INVITE_HASH_REGEX = re.compile(
     r'(?:t\.me|telegram\.me)/(?:joinchat/|\+)([A-Za-z0-9_-]+)', re.IGNORECASE
@@ -245,6 +253,8 @@ def classify_telegram_url(client, url):
                          links, this is a narrow edge case, not a catch-all
                          for non-Telegram domains anymore (see git history --
                          it used to also swallow Viber/WhatsApp/etc. links).
+      'nft_gift'      -- t.me/nft/<Name>-<num> Unique Gift page -- not a
+                         group/channel -- DROP
       'unknown'       -- resolution failed for a transient reason (flood, etc) -- KEEP, unverified
 
     A member count that couldn't be determined (missing data / a lookup
@@ -259,6 +269,9 @@ def classify_telegram_url(client, url):
     entirely for URLs already in `seen_urls`, and skippable globally via
     VALIDATE_URLS=0.
     """
+    if TG_NFT_GIFT_REGEX.search(url):
+        return {"kind": "nft_gift", "members": None}
+
     m = TG_INVITE_HASH_REGEX.search(url)
     if m:
         invite_hash = m.group(1)
@@ -603,7 +616,7 @@ def run():
     groups_data = full_dataset.get("groups", {})
 
     new_urls_this_run = []
-    rejected = {"channel": 0, "expired": 0, "invalid": 0, "small_group": 0}
+    rejected = {"channel": 0, "expired": 0, "invalid": 0, "small_group": 0, "nft_gift": 0}
     cross_account_skipped = [0]  # recorded in this account's dataset, just not re-pushed to the bot
     validation_calls = [0]  # mutable box, just for the final log line
 
@@ -909,7 +922,7 @@ def run():
                             if about:
                                 about = about.strip()[:200]  # keep the KV dataset lean
 
-                            if kind in ("channel", "expired", "invalid", "small_group"):
+                            if kind in ("channel", "expired", "invalid", "small_group", "nft_gift"):
                                 gid_seen.add(u)  # never re-check for this group again
                                 rejected[kind] += 1
                                 continue
@@ -1016,7 +1029,8 @@ def run():
         filtered_note = (
             f"\n🧹 Filtered out -- channel: {rejected.get('channel', 0)}, "
             f"small_group (≤{MIN_GROUP_MEMBERS}): {rejected.get('small_group', 0)}, "
-            f"expired: {rejected.get('expired', 0)}, invalid: {rejected.get('invalid', 0)}"
+            f"expired: {rejected.get('expired', 0)}, invalid: {rejected.get('invalid', 0)}, "
+            f"nft_gift: {rejected.get('nft_gift', 0)}"
         )
     if cross_account_skipped[0]:
         other = "NCH" if ACCOUNT == "vsn" else ("VSN" if ACCOUNT == "nch" else "the other account")
