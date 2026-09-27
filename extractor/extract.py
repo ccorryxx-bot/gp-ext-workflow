@@ -89,6 +89,12 @@ KV_URLS_KEY = f"{ACCOUNT}:urls"
 # see live progress with a single KV read, no extra Telegram/GH API calls.
 KV_LIVE_STATUS_KEY = f"{ACCOUNT}:live_status"
 KV_EXCLUDED_KEY = f"{ACCOUNT}:excluded_groups"
+# Deliberately NOT account-prefixed -- shared by VSN and NCH both. Without
+# this, if the two accounts ever happen to share a real-world group, each
+# discovers + pushes it to the bot independently (their state trees never
+# cross otherwise). This is the one piece of state both accounts read AND
+# write, so whichever account finds a group first "claims" it for the other.
+KV_GLOBAL_DELIVERED_KEY = "global:delivered_groups"
 # Id of the single bot message that gets EDITED in place with live progress
 # throughout the run (see update_live_message in run()) -- module level so
 # the top-level exception handler at the bottom of this file can also
@@ -275,8 +281,14 @@ def classify_telegram_url(client, url):
             members, about = get_group_details(client, chat)
             title = getattr(chat, "title", None)
             kind = _decide_kind(members)
-            return {"kind": kind, "members": members, "title": title, "about": about}
+            return {"kind": kind, "members": members, "title": title, "about": about, "chat_id": chat.id}
         if isinstance(result, types.ChatInvite):
+            # NOTE: unlike ChatInviteAlready, ChatInvite has NO .id field at all --
+            # Telegram doesn't expose the real chat id for an invite link nobody's
+            # joined yet (this is deliberate on Telegram's side: it stops id
+            # enumeration via bare invite links). So this is the one path with no
+            # chat_id to dedup on -- cross-account dedup falls back to matching the
+            # literal url text for this case (see run()/delivered_urls_fallback).
             if getattr(result, "broadcast", False):
                 return {"kind": "channel", "members": None}
             members, about = get_group_details(client, result)  # free -- already in the response
@@ -316,12 +328,12 @@ def classify_telegram_url(client, url):
             members, about = get_group_details(client, entity)
             title = getattr(entity, "title", None)
             kind = _decide_kind(members)
-            return {"kind": kind, "members": members, "title": title, "about": about}
+            return {"kind": kind, "members": members, "title": title, "about": about, "chat_id": entity.id}
         if isinstance(entity, types.Chat):
             members, about = get_group_details(client, entity)  # free -- embedded on Chat
             title = getattr(entity, "title", None)
             kind = _decide_kind(members)
-            return {"kind": kind, "members": members, "title": title, "about": about}
+            return {"kind": kind, "members": members, "title": title, "about": about, "chat_id": entity.id}
         return {"kind": "invalid", "members": None}  # resolved to a User or something else
 
     return {"kind": "not_telegram", "members": None}
@@ -564,6 +576,15 @@ def run():
     # different groups only ever costs its API call(s) once, not 5 times.
     url_classifications = dict(state.get("url_classifications", {}))
 
+    # Cross-account dedup (VSN vs NCH). Keyed by resolved chat_id where we
+    # have one (survives the invite link text itself changing); falls back
+    # to literal url text for the one case with no resolvable chat_id (an
+    # unjoined private invite -- see classify_telegram_url's ChatInvite note).
+    global_state = kv_get(KV_GLOBAL_DELIVERED_KEY, {"delivered_ids": {}, "delivered_urls": []})
+    delivered_ids_map = dict(global_state.get("delivered_ids", {}))  # str(chat_id) -> {account, url, at}
+    delivered_chat_ids = set(delivered_ids_map.keys())
+    delivered_urls_fallback = set(global_state.get("delivered_urls", []))
+
     # Groups excluded via the Telegram "⏭ Skip this group" button (see
     # update_live_message/build_reply_markup below) or the bot's /skipped
     # unskip flow -- written by the Worker, read-only here. gid -> {"name":
@@ -575,6 +596,7 @@ def run():
 
     new_urls_this_run = []
     rejected = {"channel": 0, "expired": 0, "invalid": 0, "small_group": 0}
+    cross_account_skipped = [0]  # recorded in this account's dataset, just not re-pushed to the bot
     validation_calls = [0]  # mutable box, just for the final log line
 
     def persist():
@@ -588,6 +610,10 @@ def run():
             "total_groups": len(groups_data),
             "total_urls": sum(len(g.get("urls", [])) for g in groups_data.values()),
             "groups": groups_data,
+        })
+        kv_put(KV_GLOBAL_DELIVERED_KEY, {
+            "delivered_ids": delivered_ids_map,
+            "delivered_urls": sorted(delivered_urls_fallback),
         })
 
     def classify_cached(client, u):
@@ -893,12 +919,34 @@ def run():
                             g["urls"].append(entry)
                             g["count"] = len(g["urls"])
 
-                            pending_batch.append(u)
-                            pending_batch_members.append(members)
-                            if len(pending_batch) >= BATCH_SIZE:
-                                flush_pending_batch()
-                                if len(new_urls_this_run) < DAILY_LIMIT:
-                                    batch_rest_sleep()
+                            # Cross-account dedup: has VSN/NCH already pushed this exact
+                            # real-world group to the bot before (either account, any past
+                            # run)? Still recorded above either way -- this only gates the
+                            # bot notification, since re-sending it is the actual worry,
+                            # not quota usage.
+                            chat_id = result.get("chat_id")
+                            already_delivered_elsewhere = (
+                                (chat_id is not None and str(chat_id) in delivered_chat_ids)
+                                or (chat_id is None and u in delivered_urls_fallback)
+                            )
+
+                            if already_delivered_elsewhere:
+                                cross_account_skipped[0] += 1
+                            else:
+                                if chat_id is not None:
+                                    delivered_chat_ids.add(str(chat_id))
+                                    delivered_ids_map[str(chat_id)] = {
+                                        "account": ACCOUNT, "url": u,
+                                        "at": datetime.now(timezone.utc).isoformat(),
+                                    }
+                                else:
+                                    delivered_urls_fallback.add(u)
+                                pending_batch.append(u)
+                                pending_batch_members.append(members)
+                                if len(pending_batch) >= BATCH_SIZE:
+                                    flush_pending_batch()
+                                    if len(new_urls_this_run) < DAILY_LIMIT:
+                                        batch_rest_sleep()
 
                             if (
                                 len(new_urls_this_run) >= DAILY_LIMIT
@@ -962,6 +1010,12 @@ def run():
             f"small_group (≤{MIN_GROUP_MEMBERS}): {rejected.get('small_group', 0)}, "
             f"expired: {rejected.get('expired', 0)}, invalid: {rejected.get('invalid', 0)}"
         )
+    if cross_account_skipped[0]:
+        other = "NCH" if ACCOUNT == "vsn" else ("VSN" if ACCOUNT == "nch" else "the other account")
+        filtered_note += (
+            f"\n🔗 Cross-account dupes: {cross_account_skipped[0]} (already pushed via {other} -- "
+            f"recorded here, not re-sent to bot)"
+        )
     if stopped_for_time_budget:
         notify_status(
             "timeout",
@@ -984,7 +1038,8 @@ def run():
         snapshot_live_status(status="idle")
     print(
         f"DONE: {len(new_urls_this_run)} new urls this run. Total (group,url) records: {total_records}. "
-        f"Rejected: {rejected}. Telegram validation API calls this run: {validation_calls[0]}. "
+        f"Rejected: {rejected}. Cross-account skipped: {cross_account_skipped[0]}. "
+        f"Telegram validation API calls this run: {validation_calls[0]}. "
         f"Elapsed: {format_elapsed()}."
     )
 
