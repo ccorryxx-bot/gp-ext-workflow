@@ -632,6 +632,22 @@ def run():
             "total_urls": sum(len(g.get("urls", [])) for g in groups_data.values()),
             "groups": groups_data,
         })
+        # Merge-on-persist for the one KV key shared by ALL accounts. We loaded
+        # it once at run start, but a run can last hours and other accounts
+        # may have claimed groups since -- blindly overwriting would wipe
+        # their claims (last-write-wins). So re-read right before writing and
+        # union theirs into ours. Mutates the sets/dict in place, so the
+        # in-run dedup checks also start seeing other accounts' new claims.
+        try:
+            remote = kv_get(KV_GLOBAL_DELIVERED_KEY, {"delivered_ids": {}, "delivered_urls": []})
+            for cid, info in remote.get("delivered_ids", {}).items():
+                delivered_ids_map.setdefault(cid, info)  # keep our own entry on a tie
+                delivered_chat_ids.add(cid)
+            delivered_urls_fallback.update(remote.get("delivered_urls", []))
+        except Exception as e:
+            # Non-fatal: falls back to the old behavior (write what we have)
+            # rather than losing this run's own claims.
+            print(f"[warn] global dedup merge read failed, writing local view only: {e}", flush=True)
         kv_put(KV_GLOBAL_DELIVERED_KEY, {
             "delivered_ids": delivered_ids_map,
             "delivered_urls": sorted(delivered_urls_fallback),

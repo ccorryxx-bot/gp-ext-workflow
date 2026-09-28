@@ -258,6 +258,12 @@ same bot chat and the same Cloudflare KV namespace:
   and `/skipped [vsn|nch|izm]` take one account, or show all without an arg.
 - `GET /urls` and `GET /status` require `?account=vsn|nch|izm`.
 - Cross-account dedup (`global:delivered_groups`) is shared by every account.
+  `persist()` re-reads that key right before writing and merges other
+  accounts' claims into its own (union, not overwrite), so accounts running
+  at the same time don't wipe each other's claims. Claims only become
+  visible to the other accounts at persist time (each batch / end of run),
+  so two accounts hitting the *same* new group within one batch window can
+  still both push it -- the merge shrinks that from a whole run to a batch.
 
 To add a third account: add its 3 `<KEY>_*` secrets, add a
 `.github/workflows/extract-<key>.yml` (copy an existing one, change
