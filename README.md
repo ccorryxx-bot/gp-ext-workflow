@@ -91,6 +91,16 @@ newline.)
 
 ## Round-robin across groups
 
+**Visiting order:** groups are visited *least-recently-scanned first*
+(`<account>:state.last_scanned_at`; never-scanned groups go first, ties keep
+Telegram's own order), not in Telegram's dialog order. Telegram's order is
+"most recently active first" and restarts from the top on every run with no
+"where I stopped" pointer, so without this a run that ends early
+(`DAILY_LIMIT`, time budget, flood) would keep spending its quota on the same
+top-of-list groups and starve the ones below. Within a group, `cursors`
+still resumes from the last processed message id -- only the *group order*
+changed, never the per-group position.
+
 Each run visits every group (not just the first one it finds new urls in).
 Per group, it stops early once it's collected `MAX_NEW_URLS_PER_DIALOG`
 (default 5) new urls or scanned `MAX_SCAN_PER_DIALOG` (default 300) messages,

@@ -588,6 +588,12 @@ def push_live_status(**fields):
 def run():
     state = kv_get(KV_STATE_KEY, {"cursors": {}, "seen_by_group": {}, "url_classifications": {}})
     cursors = state.get("cursors", {})
+    # gid -> ISO timestamp of when this account last finished a scan pass over
+    # that group. Drives the visiting order below: least-recently-scanned
+    # first (never-scanned = "" = first), so a run that stops early (DAILY_LIMIT,
+    # time budget, flood) can't keep re-spending its quota on the same
+    # top-of-list groups and starve the ones further down.
+    last_scanned_at = state.get("last_scanned_at", {})
     # seen_by_group: gid -> set of urls already recorded FOR THAT GROUP.
     # The same url can exist under multiple groups -- it's only a duplicate
     # if it was already recorded under *this* group.
@@ -623,6 +629,7 @@ def run():
     def persist():
         kv_put(KV_STATE_KEY, {
             "cursors": cursors,
+            "last_scanned_at": last_scanned_at,
             "seen_by_group": {gid: sorted(urls) for gid, urls in seen_by_group.items()},
             "url_classifications": url_classifications,
         })
@@ -819,7 +826,18 @@ def run():
 
     try:
         with TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH) as client:
-            for dialog in client.iter_dialogs():
+            # Telegram's own dialog order is "most recently active first" and
+            # restarts from the top every run -- there's no built-in "where I
+            # stopped" pointer. Sort by our own last_scanned_at instead
+            # (stable sort: ties, e.g. all never-scanned, keep Telegram order).
+            all_dialogs = [d for d in client.iter_dialogs() if d.is_group or d.is_channel]
+            all_dialogs.sort(key=lambda d: last_scanned_at.get(str(d.id), ""))
+            print(
+                f"[order] {len(all_dialogs)} group/channel dialogs, "
+                f"{sum(1 for d in all_dialogs if str(d.id) not in last_scanned_at)} never scanned",
+                flush=True,
+            )
+            for dialog in all_dialogs:
                 if len(new_urls_this_run) >= DAILY_LIMIT:
                     break
                 if time_budget_exceeded():
@@ -1012,6 +1030,7 @@ def run():
                         break
 
                 cursors[gid] = last_seen_id
+                last_scanned_at[gid] = datetime.now(timezone.utc).isoformat()
 
                 if time_budget_exceeded():
                     stopped_for_time_budget = True
