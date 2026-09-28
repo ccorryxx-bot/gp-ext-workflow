@@ -360,8 +360,36 @@ def classify_telegram_url(client, url):
     return {"kind": "not_telegram", "members": None}
 
 
-def kv_get(key, default):
-    r = requests.get(f"{KV_BASE}/values/{key}", headers=KV_HEADERS)
+# Cloudflare KV REST calls: every request gets a timeout (a hung socket with no
+# timeout would stall the run silently until GitHub's hard job-timeout kill --
+# exactly the no-notice failure MAX_RUN_MINUTES exists to prevent) and a short
+# retry/backoff on transient failures (timeouts, connection errors, 429/5xx).
+# 4xx other than 429 (bad token, bad key...) are NOT retried -- they won't fix
+# themselves, so they surface immediately via raise_for_status() in the callers.
+KV_TIMEOUT_SECONDS = int(os.environ.get("KV_TIMEOUT_SECONDS", "30"))
+KV_RETRY_STATUSES = {429, 500, 502, 503, 504}
+
+
+def _kv_request(method, key, attempts=3, **kwargs):
+    url = f"{KV_BASE}/values/{key}"
+    for attempt in range(1, attempts + 1):
+        try:
+            r = requests.request(method, url, headers=KV_HEADERS, timeout=KV_TIMEOUT_SECONDS, **kwargs)
+        except (requests.Timeout, requests.ConnectionError) as e:
+            if attempt == attempts:
+                raise
+            err = type(e).__name__
+        else:
+            if r.status_code not in KV_RETRY_STATUSES or attempt == attempts:
+                return r
+            err = f"HTTP {r.status_code}"
+        wait = 2 ** attempt  # 2s, 4s, ...
+        print(f"::warning::KV {method} {key} attempt {attempt}/{attempts} failed ({err}); retrying in {wait}s", flush=True)
+        time.sleep(wait)
+
+
+def kv_get(key, default, attempts=3):
+    r = _kv_request("GET", key, attempts=attempts)
     if r.status_code == 404:
         return default
     r.raise_for_status()
@@ -371,10 +399,9 @@ def kv_get(key, default):
         return default
 
 
-def kv_put(key, value: dict):
-    r = requests.put(
-        f"{KV_BASE}/values/{key}",
-        headers=KV_HEADERS,
+def kv_put(key, value: dict, attempts=3):
+    r = _kv_request(
+        "PUT", key, attempts=attempts,
         data=json.dumps(value, ensure_ascii=False).encode("utf-8"),
     )
     r.raise_for_status()
@@ -580,7 +607,7 @@ def push_live_status(**fields):
             "run_started_at": RUN_START_TIME.isoformat(),
         }
         payload.update(fields)
-        kv_put(KV_LIVE_STATUS_KEY, payload)
+        kv_put(KV_LIVE_STATUS_KEY, payload, attempts=1)  # best-effort: no retry, don't stall the run
     except Exception as e:
         print(f"::warning::live_status push failed (non-fatal): {type(e).__name__}: {e}")
 

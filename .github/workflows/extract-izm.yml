@@ -3,6 +3,14 @@ name: izm_ext_workflow
 on:
   workflow_dispatch: {}   # admin-triggered only (Bot /extract) -- no cron schedule
 
+# Never two runs of the same account at once: both would drive the same Telegram
+# session (session revoke risk) and race on the same KV state. Covers manual
+# dispatch from the Actions tab too, not just the bot's check. A 2nd dispatch
+# while one is running waits in the queue instead of starting (or killing) it.
+concurrency:
+  group: extract-izm
+  cancel-in-progress: false
+
 jobs:
   extract:
     runs-on: ubuntu-latest

@@ -303,6 +303,19 @@ of `worker/src/index.js`.
 
 See the setup table shared separately.
 
+## Reliability guards
+
+- **KV calls** (`kv_get` / `kv_put`) have a 30s timeout (`KV_TIMEOUT_SECONDS`)
+  and retry up to 3 attempts with 2s/4s backoff on timeouts, connection
+  errors and 429/5xx. Other 4xx (bad token etc.) fail immediately. The
+  best-effort live-status push uses 1 attempt so a KV outage can't stall a run.
+  Without a timeout, a hung request would freeze the run until GitHub's hard
+  job-timeout kill -- the same silent failure `MAX_RUN_MINUTES` exists to avoid.
+- **`concurrency:`** in each `extract-<acct>.yml` (`cancel-in-progress: false`)
+  guarantees one run per account at a time, including manual dispatches from
+  the Actions tab (the bot's own `getActiveRun` check can't see those, and is
+  check-then-trigger). A second dispatch queues until the running one finishes.
+
 ## Manual run
 
 Both workflows only run via `workflow_dispatch` -- no cron. Trigger them
