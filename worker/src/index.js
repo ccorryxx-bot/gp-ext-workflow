@@ -6,7 +6,11 @@ const REPO = "ccorryxx-bot/gp-ext-workflow";
 const ACCOUNTS = {
   vsn: { label: "VSN", workflowFile: "extract-vsn.yml" },
   nch: { label: "NCH", workflowFile: "extract-nch.yml" },
+  izm: { label: "IZM", workflowFile: "extract-izm.yml" },
 };
+const ACCOUNT_KEYS = Object.keys(ACCOUNTS);
+const ACCOUNT_EMOJI = { vsn: "🟦", nch: "🟩", izm: "🟧" };
+const ACCOUNT_PIPE = ACCOUNT_KEYS.join("|");
 
 // Single source of truth for every command this bot understands. Telegram's
 // slash-command menu (the "Menu" button popup) is NOT auto-detected from this
@@ -17,7 +21,7 @@ const ACCOUNTS = {
 const BOT_COMMANDS = [
   { command: "start", description: "Show available commands" },
   { command: "help", description: "Show available commands" },
-  { command: "extract", description: "Run extraction (asks VSN / NCH / Both)" },
+  { command: "extract", description: "Run extraction (asks VSN / NCH / IZM / All)" },
   { command: "status", description: "Latest run status + total urls" },
   { command: "skipped", description: "List manually-skipped groups" },
   { command: "sync_menu", description: "Re-sync this command list to Telegram's menu" },
@@ -40,7 +44,7 @@ export default {
     }
 
     return new Response(
-      "gp-ext-workflow worker is running.\n\nEndpoints:\n  POST /telegram-webhook  (Telegram only)\n  GET  /urls?account=vsn|nch  (extracted urls)\n  GET  /status?account=vsn|nch  (live run progress)",
+      "gp-ext-workflow worker is running.\n\nEndpoints:\n  POST /telegram-webhook  (Telegram only)\n  GET  /urls?account=" + ACCOUNT_PIPE + "  (extracted urls)\n  GET  /status?account=" + ACCOUNT_PIPE + "  (live run progress)",
       { status: 200, headers: { "content-type": "text/plain" } }
     );
   },
@@ -83,23 +87,23 @@ async function handleWebhook(request, env) {
   if (cmd === "/extract") {
     await reply(env, chatId, "ဘယ် account ကို extract run မလဲ?", {
       inline_keyboard: [
-        [
-          { text: "🟦 VSN", callback_data: "extract:vsn" },
-          { text: "🟩 NCH", callback_data: "extract:nch" },
-        ],
-        [{ text: "🔀 Both", callback_data: "extract:both" }],
+        ACCOUNT_KEYS.map((k) => ({
+          text: `${ACCOUNT_EMOJI[k] || "▫️"} ${ACCOUNTS[k].label}`,
+          callback_data: `extract:${k}`,
+        })),
+        [{ text: "🔀 All", callback_data: "extract:all" }],
       ],
     });
   } else if (cmd === "/status") {
-    if (arg === "vsn" || arg === "nch") {
+    if (ACCOUNTS[arg]) {
       await reply(env, chatId, await getStatus(env, arg));
     } else {
-      const vsn = await getStatus(env, "vsn");
-      const nch = await getStatus(env, "nch");
-      await reply(env, chatId, `${vsn}\n\n----------\n\n${nch}`);
+      const parts = [];
+      for (const k of ACCOUNT_KEYS) parts.push(await getStatus(env, k));
+      await reply(env, chatId, parts.join("\n\n----------\n\n"));
     }
   } else if (cmd === "/skipped") {
-    const accts = arg === "vsn" || arg === "nch" ? [arg] : ["vsn", "nch"];
+    const accts = ACCOUNTS[arg] ? [arg] : ACCOUNT_KEYS;
     for (const a of accts) {
       await sendSkippedList(env, chatId, a);
     }
@@ -170,7 +174,7 @@ async function handleCallbackQuery(cq, env) {
 
 async function handleExtractCallback(cq, env, chatId, data) {
   const [, target] = data.split(":");
-  const targets = target === "both" ? ["vsn", "nch"] : [target];
+  const targets = target === "all" || target === "both" ? ACCOUNT_KEYS : [target];
   const validTargets = targets.filter((t) => ACCOUNTS[t]);
 
   if (!validTargets.length) {

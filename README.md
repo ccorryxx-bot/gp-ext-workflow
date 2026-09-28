@@ -238,24 +238,26 @@ each with a `♻️ Unskip` button that removes it from the set (and future
 runs will scan it again, from wherever its `cursors` entry last left off
 -- skipping never touches or resets cursor state).
 
-## Multiple Telegram accounts (VSN / NCH)
+## Multiple Telegram accounts (VSN / NCH / IZM)
 
 This repo can run extraction for more than one Telegram account against the
 same bot chat and the same Cloudflare KV namespace:
 
-- Each account gets its own workflow file (`extract-vsn.yml`, `extract-nch.yml`)
+- Each account gets its own workflow file (`extract-vsn.yml`, `extract-nch.yml`, `extract-izm.yml`)
   and its own `<ACCOUNT>_API_ID` / `<ACCOUNT>_API_HASH` / `<ACCOUNT>_STRING_SESSION`
   GitHub secrets. `BOT_TOKEN`, `BOT_CHAT_ID`, and the `CF_*` KV secrets stay shared.
 - `ACCOUNT` (set per-workflow, e.g. `vsn`/`nch`) prefixes every KV key
   (`vsn:state`, `vsn:urls`, `nch:state`, `nch:urls`) so the two accounts'
   data never collides, and tags every bot message (`[VSN] ...`) so they
   stay distinguishable in the shared chat.
-- Cron times are staggered 30min apart (03:00 / 03:30 UTC) -- not required
-  for flood-safety (different Telegram accounts, independent limits), just
-  for cleaner monitoring.
-- `/extract` in the bot now asks which account (VSN / NCH / Both) via
-  inline buttons before dispatching; `/status [vsn|nch]` shows one or both.
-- `GET /urls` now requires `?account=vsn` or `?account=nch`.
+- No cron -- every account is admin-triggered (`workflow_dispatch`) only.
+  Different Telegram accounts have independent flood limits, so running
+  several at once is fine flood-wise.
+- `/extract` in the bot asks which account (VSN / NCH / IZM / All) via
+  inline buttons, built from the `ACCOUNTS` map; `/status [vsn|nch|izm]`
+  and `/skipped [vsn|nch|izm]` take one account, or show all without an arg.
+- `GET /urls` and `GET /status` require `?account=vsn|nch|izm`.
+- Cross-account dedup (`global:delivered_groups`) is shared by every account.
 
 To add a third account: add its 3 `<KEY>_*` secrets, add a
 `.github/workflows/extract-<key>.yml` (copy an existing one, change

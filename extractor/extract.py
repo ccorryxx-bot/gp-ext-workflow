@@ -75,10 +75,10 @@ CF_ACCOUNT_ID = os.environ["CF_ACCOUNT_ID"]
 CF_API_TOKEN = os.environ["CF_API_TOKEN"]
 CF_KV_NAMESPACE_ID = os.environ["CF_KV_NAMESPACE_ID"]
 
-# Which Telegram account this run is for (e.g. "vsn", "nch"). Multiple
+# Which Telegram account this run is for (e.g. "vsn", "nch", "izm"). Multiple
 # accounts can share one KV namespace + one bot chat: this prefixes every
 # KV key ("<account>:state", "<account>:urls") so their data never
-# collides, and every bot message gets tagged "[VSN]"/"[NCH]" so it's
+# collides, and every bot message gets tagged "[VSN]"/"[NCH]"/"[IZM]" so it's
 # obvious which account it came from.
 ACCOUNT = os.environ.get("ACCOUNT", "default")
 KV_STATE_KEY = f"{ACCOUNT}:state"
@@ -89,7 +89,7 @@ KV_URLS_KEY = f"{ACCOUNT}:urls"
 # see live progress with a single KV read, no extra Telegram/GH API calls.
 KV_LIVE_STATUS_KEY = f"{ACCOUNT}:live_status"
 KV_EXCLUDED_KEY = f"{ACCOUNT}:excluded_groups"
-# Deliberately NOT account-prefixed -- shared by VSN and NCH both. Without
+# Deliberately NOT account-prefixed -- shared by every account (VSN, NCH, IZM...). Without
 # this, if the two accounts ever happen to share a real-world group, each
 # discovers + pushes it to the bot independently (their state trees never
 # cross otherwise). This is the one piece of state both accounts read AND
@@ -597,7 +597,7 @@ def run():
     # different groups only ever costs its API call(s) once, not 5 times.
     url_classifications = dict(state.get("url_classifications", {}))
 
-    # Cross-account dedup (VSN vs NCH). Keyed by resolved chat_id where we
+    # Cross-account dedup (VSN / NCH / IZM, any account vs any other). Keyed by resolved chat_id where we
     # have one (survives the invite link text itself changing); falls back
     # to literal url text for the one case with no resolvable chat_id (an
     # unjoined private invite -- see classify_telegram_url's ChatInvite note).
@@ -940,7 +940,7 @@ def run():
                             g["urls"].append(entry)
                             g["count"] = len(g["urls"])
 
-                            # Cross-account dedup: has VSN/NCH already pushed this exact
+                            # Cross-account dedup: has any other account already pushed this exact
                             # real-world group to the bot before (either account, any past
                             # run)? Still recorded above either way -- this only gates the
                             # bot notification, since re-sending it is the actual worry,
@@ -1033,7 +1033,7 @@ def run():
             f"nft_gift: {rejected.get('nft_gift', 0)}"
         )
     if cross_account_skipped[0]:
-        other = "NCH" if ACCOUNT == "vsn" else ("VSN" if ACCOUNT == "nch" else "the other account")
+        other = "another account"
         filtered_note += (
             f"\n🔗 Cross-account dupes: {cross_account_skipped[0]} (already pushed via {other} -- "
             f"recorded here, not re-sent to bot)"
