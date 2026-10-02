@@ -50,6 +50,15 @@ from telethon.errors import (
     UsernameNotOccupiedError,
     UsernameInvalidError,
     ChannelPrivateError,
+    ChannelInvalidError,
+    ChannelBannedError,
+    UserBannedInChannelError,
+    AuthKeyDuplicatedError,
+    AuthKeyUnregisteredError,
+    SessionRevokedError,
+    SessionExpiredError,
+    UserDeactivatedError,
+    UserDeactivatedBanError,
 )
 
 API_ID = int(os.environ["API_ID"])
@@ -85,7 +94,7 @@ KV_STATE_KEY = f"{ACCOUNT}:state"
 KV_URLS_KEY = f"{ACCOUNT}:urls"
 # Lightweight, frequently-overwritten progress snapshot for the bot's
 # /status command -- separate from KV_STATE_KEY (which only gets written
-# at persist(), i.e. batch/end/interrupt) so a mid-run /status check can
+# at persist(), i.e. periodic checkpoint/end/flood/error) so a mid-run /status check can
 # see live progress with a single KV read, no extra Telegram/GH API calls.
 KV_LIVE_STATUS_KEY = f"{ACCOUNT}:live_status"
 KV_EXCLUDED_KEY = f"{ACCOUNT}:excluded_groups"
@@ -119,6 +128,67 @@ MIN_GROUP_MEMBERS = int(os.environ.get("MIN_GROUP_MEMBERS", "1500"))
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "10"))
 BATCH_REST_MIN_SECONDS = int(os.environ.get("BATCH_REST_MIN_MINUTES", "15")) * 60
 BATCH_REST_MAX_SECONDS = int(os.environ.get("BATCH_REST_MAX_MINUTES", "30")) * 60
+
+# "THIS group is no longer readable by this account" -- kicked, banned, the
+# group went private, or Telegram/its owner deleted or banned it. Telegram
+# answers CHANNEL_PRIVATE etc. for all of these. It is a per-group event that
+# happens regularly for an account sitting in hundreds of groups (the dialog
+# list is snapshotted at run start, but a group can be reached hours later),
+# so it must skip that one group -- never kill the whole multi-hour run.
+GROUP_ACCESS_ERRORS = (
+    ChannelPrivateError,
+    ChannelInvalidError,
+    ChannelBannedError,
+    UserBannedInChannelError,
+)
+# Session/account-level errors: the account itself is unusable, retrying or
+# skipping a group can't help. Handled by saving progress then failing loudly
+# with an actionable hint (see _fatal_hint).
+FATAL_SESSION_ERRORS = (
+    AuthKeyDuplicatedError,
+    AuthKeyUnregisteredError,
+    SessionRevokedError,
+    SessionExpiredError,
+    UserDeactivatedError,
+    UserDeactivatedBanError,
+)
+# A group that raised GROUP_ACCESS_ERRORS is skipped for this long before
+# being tried again (access can come back, e.g. re-added or made public).
+# Groups that vanish from the dialog list entirely are forgotten.
+INACCESSIBLE_RETRY_SECONDS = int(os.environ.get("INACCESSIBLE_RETRY_HOURS", "24")) * 3600
+# Checkpoint progress to KV at most this often (checked between groups), so an
+# OS-level kill / runner loss costs minutes of work, not hours. 0 disables.
+PERSIST_INTERVAL_SECONDS = int(os.environ.get("PERSIST_INTERVAL_MINUTES", "30")) * 60
+
+# Which group the run was in -- module level so the top-level crash handler
+# can name it in the failure notice instead of erasing that evidence.
+FAIL_CONTEXT = {}
+
+
+def _inaccessible_retry_due(info):
+    try:
+        at = datetime.fromisoformat(info["at"])
+    except Exception:
+        return True  # malformed entry -> just retry the group
+    return (datetime.now(timezone.utc) - at).total_seconds() >= INACCESSIBLE_RETRY_SECONDS
+
+
+def _fatal_hint(exc):
+    """Actionable Burmese hint for session-level failures; '' for anything else."""
+    if isinstance(exc, AuthKeyDuplicatedError):
+        return (
+            "\n🔑 Session ကို IP ၂ ခုကနေ တစ်ပြိုင်နက်သုံးမိလို့ Telegram က key ကို ပိတ်လိုက်ပါပြီ။\n"
+            "စစ်ရန်: ဒီ account ရဲ့ workflow ၂ ခု တစ်ပြိုင်နက် run နေသလား၊ STRING_SESSION ကို "
+            "တခြားနေရာ (local/script/VPS) မှာ သုံးနေသလား။\n"
+            f"ပြင်ရန်: generate_session.py နဲ့ session အသစ်ထုတ်ပြီး {ACCOUNT.upper()}_STRING_SESSION secret ကို update လုပ်ပါ။"
+        )
+    if isinstance(exc, FATAL_SESSION_ERRORS):
+        return (
+            "\n🔑 Account/session ကို Telegram က လက်မခံတော့ပါ (revoked/expired/deactivated)။\n"
+            f"ပြင်ရန်: generate_session.py နဲ့ session အသစ်ထုတ်ပြီး {ACCOUNT.upper()}_STRING_SESSION secret ကို update လုပ်ပါ "
+            "(account ကိုယ်တိုင် ban/deactivate ဖြစ်ရင် Telegram app မှာ စစ်ပါ)။"
+        )
+    return ""
 
 URL_REGEX = re.compile(
     r'(?:https?://)?(?:t\.me|telegram\.me)/[^\s<>"\')\]]+',
@@ -621,6 +691,11 @@ def run():
     # time budget, flood) can't keep re-spending its quota on the same
     # top-of-list groups and starve the ones further down.
     last_scanned_at = state.get("last_scanned_at", {})
+    # gid -> {"name", "error", "at"}: groups that raised GROUP_ACCESS_ERRORS
+    # recently. Skipped until INACCESSIBLE_RETRY_SECONDS passes (see dialog loop).
+    inaccessible_groups = dict(state.get("inaccessible_groups", {}))
+    inaccessible_this_run = []  # (gid, name, error_name) newly hit in THIS run
+    inaccessible_still_skipped = [0]  # still inside their retry window, not re-tried
     # seen_by_group: gid -> set of urls already recorded FOR THAT GROUP.
     # The same url can exist under multiple groups -- it's only a duplicate
     # if it was already recorded under *this* group.
@@ -653,10 +728,13 @@ def run():
     cross_account_skipped = [0]  # recorded in this account's dataset, just not re-pushed to the bot
     validation_calls = [0]  # mutable box, just for the final log line
 
+    last_persist_box = [datetime.now(timezone.utc)]
+
     def persist():
         kv_put(KV_STATE_KEY, {
             "cursors": cursors,
             "last_scanned_at": last_scanned_at,
+            "inaccessible_groups": inaccessible_groups,
             "seen_by_group": {gid: sorted(urls) for gid, urls in seen_by_group.items()},
             "url_classifications": url_classifications,
         })
@@ -686,6 +764,7 @@ def run():
             "delivered_ids": delivered_ids_map,
             "delivered_urls": sorted(delivered_urls_fallback),
         })
+        last_persist_box[0] = datetime.now(timezone.utc)
 
     def classify_cached(client, u):
         cached = url_classifications.get(u)
@@ -716,7 +795,7 @@ def run():
         if not ok:
             print(
                 f"::error::Batch {batch_counter[0]} ({len(pending_batch)} url(s)) Bot ဆီ ပို့ မရပါ -- "
-                f"KV ထဲ ရေးထားပြီးသားပါ, Bot notify သာ fail တာပါ။"
+                f"Bot notify သာ fail တာပါ -- url တွေက run state ထဲရှိပြီး checkpoint/run-end persist မှာ KV ထဲရောက်မယ်။"
             )
         pending_batch.clear()
         pending_batch_members.clear()
@@ -859,6 +938,11 @@ def run():
             # (stable sort: ties, e.g. all never-scanned, keep Telegram order).
             all_dialogs = [d for d in client.iter_dialogs() if d.is_group or d.is_channel]
             all_dialogs.sort(key=lambda d: last_scanned_at.get(str(d.id), ""))
+            # Groups that are gone from the dialog list entirely (we were
+            # removed / they were deleted) need no tracking any more.
+            _live_ids = {str(d.id) for d in all_dialogs}
+            for _gid in [g for g in inaccessible_groups if g not in _live_ids]:
+                del inaccessible_groups[_gid]
             print(
                 f"[order] {len(all_dialogs)} group/channel dialogs, "
                 f"{sum(1 for d in all_dialogs if str(d.id) not in last_scanned_at)} never scanned",
@@ -877,7 +961,13 @@ def run():
                 if gid in excluded_groups:
                     continue
 
+                bad = inaccessible_groups.get(gid)
+                if bad and not _inaccessible_retry_due(bad):
+                    inaccessible_still_skipped[0] += 1
+                    continue
+
                 current_gid[0] = gid
+                FAIL_CONTEXT.update(current_group=dialog.name, current_group_id=gid)
                 last_seen_id = cursors.get(gid, 0)
                 gid_seen = seen_by_group.setdefault(gid, set())
                 scanned = 0
@@ -947,6 +1037,22 @@ def run():
                                 notify_status("flood", f"FloodWait {e.seconds}s ကြုံရလို့ စောင့်နေပါတယ်...")
                             safe_sleep(e.seconds)
                             continue
+                    except GROUP_ACCESS_ERRORS as e:
+                        # Kicked/banned/private/deleted since the dialog list was
+                        # taken. Skip THIS group only; whatever it already yielded
+                        # stays recorded, and everything else keeps running.
+                        inaccessible_groups[gid] = {
+                            "name": dialog.name,
+                            "error": type(e).__name__,
+                            "at": datetime.now(timezone.utc).isoformat(),
+                        }
+                        inaccessible_this_run.append((gid, dialog.name, type(e).__name__))
+                        print(
+                            f"::warning::Group inaccessible, skipping it (run continues): "
+                            f"{dialog.name!r} id={gid} -- {type(e).__name__}",
+                            flush=True,
+                        )
+                        break
 
                     if not messages:
                         break
@@ -1059,6 +1165,23 @@ def run():
                 cursors[gid] = last_seen_id
                 last_scanned_at[gid] = datetime.now(timezone.utc).isoformat()
 
+                if PERSIST_INTERVAL_SECONDS > 0 and (
+                    datetime.now(timezone.utc) - last_persist_box[0]
+                ).total_seconds() >= PERSIST_INTERVAL_SECONDS:
+                    # Group boundary = consistent state. Flush the pending batch
+                    # first so nothing is recorded in KV as "found/delivered"
+                    # without having actually been sent to the bot.
+                    try:
+                        flush_pending_batch()
+                        persist()
+                        print("[persist] periodic checkpoint saved", flush=True)
+                    except Exception as pe:
+                        last_persist_box[0] = datetime.now(timezone.utc)  # back off, don't retry every group
+                        print(
+                            f"::warning::periodic persist failed (non-fatal): {type(pe).__name__}: {pe}",
+                            flush=True,
+                        )
+
                 if time_budget_exceeded():
                     stopped_for_time_budget = True
                     break
@@ -1082,6 +1205,18 @@ def run():
         )
         snapshot_live_status(status="flood")
         sys.exit(1)
+    except (Exception, KeyboardInterrupt):
+        # Anything unexpected (incl. session-level errors and a manual
+        # cancel): don't throw away hours of progress. Best effort -- never
+        # let the save itself mask the original error -- then re-raise so the
+        # top-level handler still reports it and the job still fails.
+        try:
+            flush_pending_batch()
+            persist()
+            print("[persist] progress saved before exiting on error", flush=True)
+        except Exception as pe:
+            print(f"::warning::could not save progress on error: {type(pe).__name__}: {pe}", flush=True)
+        raise
 
     flush_pending_batch()
     persist()
@@ -1100,6 +1235,15 @@ def run():
             f"\n🔗 Cross-account dupes: {cross_account_skipped[0]} (already pushed via {other} -- "
             f"recorded here, not re-sent to bot)"
         )
+    if inaccessible_this_run:
+        shown = "; ".join((n or gid)[:40] for gid, n, _ in inaccessible_this_run[:5])
+        more = f" +{len(inaccessible_this_run) - 5} more" if len(inaccessible_this_run) > 5 else ""
+        filtered_note += (
+            f"\n🚫 Inaccessible (kicked/banned/private) -- skipped: {len(inaccessible_this_run)} -- {shown}{more}"
+            f"\n   (retry after {INACCESSIBLE_RETRY_SECONDS // 3600}h)"
+        )
+    if inaccessible_still_skipped[0]:
+        filtered_note += f"\n⏸ Still in retry window, not re-tried: {inaccessible_still_skipped[0]}"
     if stopped_for_time_budget:
         notify_status(
             "timeout",
@@ -1123,6 +1267,7 @@ def run():
     print(
         f"DONE: {len(new_urls_this_run)} new urls this run. Total (group,url) records: {total_records}. "
         f"Rejected: {rejected}. Cross-account skipped: {cross_account_skipped[0]}. "
+        f"Inaccessible groups this run: {len(inaccessible_this_run)}. "
         f"Telegram validation API calls this run: {validation_calls[0]}. "
         f"Elapsed: {format_elapsed()}."
     )
@@ -1135,15 +1280,19 @@ if __name__ == "__main__":
         raise
     except Exception as e:
         err_msg = f"{type(e).__name__}: {e}"
+        ctx_line = ""
+        if FAIL_CONTEXT.get("current_group"):
+            ctx_line = f"\n📍 Last group: {FAIL_CONTEXT['current_group']} (id {FAIL_CONTEXT.get('current_group_id')})"
+        hint = _fatal_hint(e)
         # Print first -- this line shows up in the Actions run summary even
         # if the bot notify below also fails, so a fully silent failure
         # (no bot message AND nothing visible) is no longer possible.
         print(f"::error::Action ရပ်သွားခဲ့သည်, ဘာဖြစ်လို့ error: {err_msg}")
-        notify_status("failed", f"Error ကြောင့် workflow ရပ်သွားပါတယ်:\n{err_msg}\n⏱ Run duration: {format_elapsed()}")
-        push_live_status(status="failed", error=err_msg)
+        notify_status("failed", f"Error ကြောင့် workflow ရပ်သွားပါတယ်:\n{err_msg}{ctx_line}{hint}\n⏱ Run duration: {format_elapsed()}")
+        push_live_status(status="failed", error=err_msg, **FAIL_CONTEXT)
         if LIVE_MESSAGE_ID[0] is not None:
             _edit_telegram_message(
                 LIVE_MESSAGE_ID[0],
-                f"❌ failed -- {err_msg}\n⏱ Run duration: {format_elapsed()}",
+                f"❌ failed -- {err_msg}{ctx_line}{hint}\n⏱ Run duration: {format_elapsed()}",
             )
         raise

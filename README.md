@@ -315,6 +315,33 @@ See the setup table shared separately.
   guarantees one run per account at a time, including manual dispatches from
   the Actions tab (the bot's own `getActiveRun` check can't see those, and is
   check-then-trigger). A second dispatch queues until the running one finishes.
+- **Inaccessible groups are skipped, not fatal.** The dialog list is
+  snapshotted at run start but a group can be reached hours later, and an
+  account in hundreds of groups regularly gets kicked/banned from some (or
+  Telegram deletes/bans the group). Telegram then answers `CHANNEL_PRIVATE` /
+  `CHANNEL_INVALID` / `CHANNEL_BANNED` / `USER_BANNED_IN_CHANNEL`
+  (`GROUP_ACCESS_ERRORS`). That skips *that group only*: it's recorded in
+  `<acct>:state.inaccessible_groups` with the error + time, not retried for
+  `INACCESSIBLE_RETRY_HOURS` (default 24), forgotten once it leaves the dialog
+  list, and reported in the run summary (🚫). Before this, one such group
+  killed a 4.5h run and discarded all of its progress (NCH runs #17/#18).
+- **Progress is never silently discarded.** `persist()` runs at run end, on
+  flood aborts, **on any unexpected error / manual cancel** (best effort, then
+  the error re-raises so the job still fails), and as a **periodic checkpoint**
+  between groups every `PERSIST_INTERVAL_MINUTES` (default 30; `0` disables) --
+  so even an OS-level kill or lost runner costs minutes, not hours. The
+  pending batch is flushed to the bot before each checkpoint so KV never
+  records a url as delivered that the bot didn't get.
+- **Session-level errors fail loudly with a fix.** `AuthKeyDuplicatedError`
+  (session used from two IPs at once -- e.g. two overlapping runs, which
+  the `concurrency:` guard now prevents), `AuthKeyUnregistered`,
+  `SessionRevoked/Expired`, `UserDeactivated(Ban)` save progress, then the bot
+  notice explains what to check and to regenerate the session
+  (`generate_session.py`). Crash notices also name the last group
+  (`📍 Last group`) and keep it in `live_status`.
+
+Offline tests for all of this (no Telegram/Cloudflare needed):
+`cd extractor && python -m unittest discover -s tests -v`
 
 ## Manual run
 
